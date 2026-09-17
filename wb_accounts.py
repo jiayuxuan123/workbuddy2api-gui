@@ -3,6 +3,7 @@ import base64
 import json
 import os
 import ssl
+import tempfile
 import threading
 import time
 import urllib.error
@@ -25,6 +26,28 @@ def _retryable(exc):
     return False
 
 
+#: Hosts this module may contact. Every request is built from a REALM_CONFIGS
+#: entry; the check in http_json re-verifies at call time so a future edit
+#: cannot quietly point a request at an arbitrary destination.
+ALLOWED_HOSTS = ("www.workbuddy.ai", "copilot.tencent.com", "www.codebuddy.cn")
+
+
+def _checked_url(url):
+    """Reject a URL that is not HTTPS on a known upstream host.
+
+    Kept next to the request rather than trusted to the caller: these URLs are
+    assembled from configuration, and a single bad value would otherwise send
+    an authenticated request (the account's bearer token is attached) to
+    whatever host it named.
+    """
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "https":
+        raise ValueError("refusing non-HTTPS upstream URL")
+    if parsed.hostname not in ALLOWED_HOSTS:
+        raise ValueError("refusing unknown upstream host: %r" % parsed.hostname)
+    return url
+
+
 def http_json(url, data=None, method=None, headers=None, timeout=30,
               retries=3, backoff=1.0, log=None):
     """urlopen + json decode with retries.
@@ -32,7 +55,11 @@ def http_json(url, data=None, method=None, headers=None, timeout=30,
     Chinese networks and CDN edges routinely drop a TLS handshake with
     "SSL: UNEXPECTED_EOF_WHILE_READING"; a single retry almost always
     succeeds, so every upstream call goes through here.
+
+    The URL is validated before use: these requests carry the account's bearer
+    token, so the destination must be one of the known upstream hosts.
     """
+    _checked_url(url)
     attempts = max(1, int(retries or 1))
     last = None
     for attempt in range(1, attempts + 1):
@@ -203,15 +230,36 @@ class Account(object):
         }
 
     def save(self, directory):
+        """Write this account to ``directory`` as ``<uid>.json``.
+
+        The filename derives from a uid that arrives from the upstream
+        profile, so it is reduced to ``[A-Za-z0-9_-]`` first (no path
+        separator can survive) and the resolved path is then checked for
+        containment with ``os.path.commonpath`` rather than a string prefix -
+        a prefix test would also accept a sibling directory whose name merely
+        starts with the same characters (``/data/accounts-evil`` passes a
+        check for ``/data/accounts``).
+
+        The temporary file is created by ``tempfile.mkstemp`` inside the
+        target directory, so its name is chosen by the standard library rather
+        than assembled here, and ``os.replace`` then moves it into place.
+        That keeps the write atomic without ever opening a caller-derived
+        path for writing.
+        """
         os.makedirs(directory, exist_ok=True)
+        root = os.path.realpath(directory)
         safe_uid = re.sub(r"[^A-Za-z0-9_-]", "_", str(self.uid or "")).strip("_ ")
         name = (safe_uid or uuid.uuid4().hex) + ".json"
-        path = os.path.abspath(os.path.join(directory, name))
-        if not path.startswith(os.path.abspath(directory)):
+        path = os.path.realpath(os.path.join(root, name))
+        if os.path.commonpath([path, root]) != root:
             raise ValueError("invalid path for account save")
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(self.to_dict(), fh, ensure_ascii=False, indent=2)
+
+        payload = json.dumps(self.to_dict(), ensure_ascii=False, indent=2)
+        fd, tmp = tempfile.mkstemp(prefix=".acct-", suffix=".tmp", dir=root)
+        try:
+            os.write(fd, payload.encode("utf-8"))
+        finally:
+            os.close(fd)
         os.replace(tmp, path)
         self.path = path
         return path
@@ -724,7 +772,9 @@ class AccountPool(object):
         uid = jwt_uid(token)
         nickname = ""
         try:
-            acct_url = "%s%s?state=%s" % (cfg["chat_upstream"], LOGIN_ACCOUNT_PATH, urllib.parse.quote(state))
+            acct_url = _checked_url("%s%s?state=%s" % (
+                cfg["chat_upstream"], LOGIN_ACCOUNT_PATH,
+                urllib.parse.quote(state)))
             acct_headers = dict(headers)
             acct_headers["Authorization"] = "Bearer " + token
             req_acct = urllib.request.Request(acct_url, method="GET", headers=acct_headers)

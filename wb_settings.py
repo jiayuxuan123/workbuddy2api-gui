@@ -12,6 +12,7 @@ import hmac
 import json
 import os
 import secrets
+import tempfile
 import threading
 import time
 
@@ -48,13 +49,26 @@ def load(accounts_dir):
 
 
 def save(accounts_dir, data):
-    """Atomic write so a crash cannot leave a half-written settings file."""
+    """Atomic write so a crash cannot leave a half-written settings file.
+
+    The file name is fixed (``settings.json``) and the directory comes from
+    configuration, but the resolved path is still checked for containment, and
+    the temporary file is created by ``tempfile.mkstemp`` so its name is
+    chosen by the standard library rather than assembled here.
+    """
     with _lock:
         os.makedirs(accounts_dir, exist_ok=True)
-        path = settings_path(accounts_dir)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, ensure_ascii=False, indent=2)
+        root = os.path.realpath(accounts_dir)
+        path = os.path.realpath(settings_path(root))
+        if os.path.commonpath([path, root]) != root:
+            raise ValueError("settings path escapes the accounts directory")
+
+        payload = json.dumps(data, ensure_ascii=False, indent=2)
+        fd, tmp = tempfile.mkstemp(prefix=".settings-", suffix=".tmp", dir=root)
+        try:
+            os.write(fd, payload.encode("utf-8"))
+        finally:
+            os.close(fd)
         os.replace(tmp, path)
         return path
 

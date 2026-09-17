@@ -20,6 +20,7 @@ import os
 MAX_PAYLOAD_BYTES = int(os.environ.get("WB_MAX_PAYLOAD_BYTES", 50 * 1024 * 1024))  # 50MB limit
 import socket
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -111,6 +112,10 @@ def install_console_close_handler():
     except Exception:
         return None
 UPSTREAM = "https://www.workbuddy.ai"
+#: Hosts this process may send authenticated requests to. Requests built below
+#: are re-validated against this list before being sent: they carry the
+#: account's bearer token, so the destination must never be attacker-chosen.
+UPSTREAM_HOSTS = ("www.workbuddy.ai", "copilot.tencent.com", "www.codebuddy.cn")
 CHAT_PATH = "/v2/chat/completions"
 MODELS_PATH = "/v2/enterprises/personal/models"
 DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
@@ -369,12 +374,26 @@ def _persist_usage(row, summary, fail_label):
         log("%s (row dropped): %s" % (fail_label, exc))
         return
 
-    tmp_summary = "%s.%d.%d.tmp" % (USAGE_SUMMARY, os.getpid(), threading.get_ident())
+    # Confine the target the same way the row append is confined, then let
+    # tempfile pick the temporary name inside that directory. The previous
+    # approach appended a pid/tid suffix to the target path, which is a name
+    # assembled here rather than by the standard library.
+    try:
+        summary_path = _usage_file_path(USAGE_SUMMARY)
+    except Exception as exc:
+        log("%s (summary only): %s" % (fail_label, exc))
+        return
+    summary_dir = os.path.dirname(summary_path)
     try:
         with _persist_lock:
-            with open(tmp_summary, "w", encoding="utf-8") as fh:
-                json.dump(summary, fh, ensure_ascii=False, indent=2)
-            os.replace(tmp_summary, USAGE_SUMMARY)
+            fd, tmp_summary = tempfile.mkstemp(
+                prefix=".usage-", suffix=".tmp", dir=summary_dir)
+            try:
+                os.write(fd, json.dumps(summary, ensure_ascii=False,
+                                        indent=2).encode("utf-8"))
+            finally:
+                os.close(fd)
+            os.replace(tmp_summary, summary_path)
     except Exception as exc:
         # Derived data only: the JSONL still holds the truth and the next
         # request rewrites the summary. Never let this drop a row.
@@ -549,13 +568,32 @@ def load_persisted_realm():
             log("could not load active realm: %s" % e)
     return CURRENT_REALM
 def save_persisted_realm(realm):
+    """Persist the active realm, confining the write to the accounts directory.
+
+    ``realm`` is already restricted to the two known values above; the path
+    check and the stdlib-chosen temp name guard the file itself, so the write
+    cannot land outside the data directory.
+    """
     global CURRENT_REALM
     if realm in ("intl", "cn"):
         CURRENT_REALM = realm
         try:
-            os.makedirs(ACCOUNTS_DIR, exist_ok=True)
-            with open(REALM_STATE_FILE, "w", encoding="utf-8") as fh:
-                json.dump({"realm": realm, "updated_at": time.time(), "updated_iso": time.strftime("%Y-%m-%d %H:%M:%S")}, fh, indent=2)
+            root = os.path.realpath(ACCOUNTS_DIR)
+            os.makedirs(root, exist_ok=True)
+            target = os.path.realpath(REALM_STATE_FILE)
+            if os.path.commonpath([target, root]) != root:
+                raise ValueError("realm state path escapes the accounts dir")
+            payload = json.dumps({
+                "realm": realm,
+                "updated_at": time.time(),
+                "updated_iso": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }, indent=2)
+            fd, tmp = tempfile.mkstemp(prefix=".realm-", suffix=".tmp", dir=root)
+            try:
+                os.write(fd, payload.encode("utf-8"))
+            finally:
+                os.close(fd)
+            os.replace(tmp, target)
             log("persisted active realm '%s' to disk" % realm)
         except Exception as exc:
             log("failed to persist active realm: %s" % exc)
@@ -1142,7 +1180,11 @@ def fetch_endpoint_models():
         log("model discovery skipped: no usable account")
         cached = _models_cache.get("intl", {}).get("data")
         return [m for m, _ in (cached or [])]
-    req = urllib.request.Request(UPSTREAM + MODELS_PATH, method="GET", headers=account.headers())
+    url = UPSTREAM + MODELS_PATH
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname not in UPSTREAM_HOSTS:
+        raise RuntimeError("refusing unknown upstream host: %r" % parsed.hostname)
+    req = urllib.request.Request(url, method="GET", headers=account.headers())
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
@@ -1522,6 +1564,12 @@ def open_upstream(payload, session_key=None, target_realm=None):
         tried.add(account.uid)
         cfg = wb_accounts.get_realm_config(account.realm)
         chat_url = cfg["chat_upstream"] + CHAT_PATH
+        # This request carries the account's bearer token, so verify the host
+        # before sending rather than trusting the configuration blindly.
+        parsed = urlparse(chat_url)
+        if parsed.scheme != "https" or parsed.hostname not in UPSTREAM_HOSTS:
+            raise RuntimeError(
+                "refusing unknown upstream host: %r" % parsed.hostname)
         req = urllib.request.Request(chat_url, data=body, method="POST",
                                      headers=account.headers(purpose="chat"))
         try:

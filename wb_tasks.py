@@ -129,9 +129,53 @@ def accept_tasks(account, codes):
         return False
 
 
+def _safe_task_code(code):
+    """Validate a task code before it is interpolated into a request path.
+
+    The code comes from the upstream task list, so a malformed or hostile
+    response could otherwise place ``../``, ``@`` or ``?`` inside the URL and
+    redirect the request somewhere unintended. Task codes are short opaque
+    identifiers, so anything outside that shape is rejected outright.
+    """
+    code = str(code or "").strip()
+    if not code or len(code) > 128:
+        return ""
+    if not all(ch.isalnum() or ch in "-_" for ch in code):
+        return ""
+    return code
+
+
+#: Hosts this module is allowed to talk to. Every request below is built from
+#: one of these constants; ``_checked_url`` re-verifies that at call time so a
+#: future edit cannot quietly point a request at an arbitrary destination.
+ALLOWED_HOSTS = ("copilot.tencent.com", "www.codebuddy.cn", "www.workbuddy.cn")
+
+
+def _checked_url(base, path):
+    """Build a request URL, refusing anything outside the known upstream hosts.
+
+    Checks the scheme is HTTPS and the host is on the allow-list before the
+    URL is handed to urllib. The hosts are module constants today, but keeping
+    the check next to the request means a bad value cannot slip through
+    unnoticed - and it rules out a redirect or a typo reaching an internal
+    address.
+    """
+    from urllib.parse import urlparse
+    url = base.rstrip("/") + "/" + path.lstrip("/")
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        raise ValueError("refusing non-HTTPS upstream URL")
+    if parsed.hostname not in ALLOWED_HOSTS:
+        raise ValueError("refusing unknown upstream host: %r" % parsed.hostname)
+    return url
+
+
 def claim_task(account, code):
     """领取任务奖励。支持 copilot.tencent.com -> www.workbuddy.cn 自动降级。"""
-    url = f"{CHAT_BASE}/activity/growth/tasks/{code}/claim"
+    code = _safe_task_code(code)
+    if not code:
+        return {"ok": False, "msg": "任务编号非法，已跳过"}
+    url = _checked_url(CHAT_BASE, "/activity/growth/tasks/%s/claim" % code)
     req = urllib.request.Request(url, data=b"", method="POST", headers=account.headers("chat"))
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -142,7 +186,8 @@ def claim_task(account, code):
     except urllib.error.HTTPError as exc:
         if exc.code == 400:
             # 降级到 web 域领奖
-            web_url = f"{WEB_BASE}/activity/growth/tasks/{code}/claim"
+            web_url = _checked_url(
+                WEB_BASE, "/activity/growth/tasks/%s/claim" % code)
             web_hdrs = {
                 "Authorization": "Bearer " + account.access_token,
                 "Accept": "application/json, text/plain, */*",
@@ -230,7 +275,7 @@ def build_event(account, kind, idx=0):
 
 def report_events(account, events, base=BILL_BASE):
     """向上游上报事件数组。"""
-    url = base + "/v2/report"
+    url = _checked_url(base, "/v2/report")
     headers = account.headers("billing" if base == BILL_BASE else "chat")
     body = json.dumps(events).encode("utf-8")
     req = urllib.request.Request(url, data=body, method="POST", headers=headers)
