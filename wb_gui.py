@@ -32,8 +32,10 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
-    QDialogButtonBox, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView,
-    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu,
+    QDialogButtonBox, QFileDialog, QFrame, QGridLayout, QGroupBox, QHBoxLayout,
+    QHeaderView,
+    QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
+    QMenu,
     QMessageBox, QPlainTextEdit, QPushButton, QRadioButton, QScrollArea,
     QSizePolicy, QSpinBox, QStatusBar, QSystemTrayIcon, QTableWidget,
     QTableWidgetItem, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
@@ -43,6 +45,7 @@ import wb_autostart
 import wb_gateway
 import wb_proxy
 import wb_runtime
+import wb_settings
 import wb_ui_theme as theme
 
 REALM_LABELS = {"intl": "国际版", "cn": "国内版"}
@@ -456,6 +459,37 @@ class LoginDialog(QDialog):
 class MainWindow(QMainWindow):
     """The application window."""
 
+    # ---------------------------------------------------------- dialog helpers
+    #
+    # Every confirmation and notice goes through these methods instead of
+    # calling QMessageBox directly. Two reasons:
+    #
+    #   * they are the only modal entry points, so a headless test can override
+    #     them and exercise the logic underneath without a dialog blocking
+    #     forever. QMessageBox is a Qt class, so patching it from Python has no
+    #     effect on the code being tested;
+    #   * the parent window and the button wording stay consistent.
+    def ask(self, title, text):
+        """Ask a yes/no question. Returns True when the user chose Yes."""
+        return QMessageBox.question(self, title, text) == QMessageBox.Yes
+
+    def info(self, title, text):
+        """Show an informational notice."""
+        QMessageBox.information(self, title, text)
+
+    def warn(self, title, text):
+        """Show a warning."""
+        QMessageBox.warning(self, title, text)
+
+    def fail(self, title, text):
+        """Report an error."""
+        QMessageBox.critical(self, title, text)
+
+    def ask_text(self, title, prompt, default=""):
+        """Prompt for one line of text. Returns (text, accepted)."""
+        return QInputDialog.getText(self, title, prompt, text=default)
+
+
     def __init__(self, args):
         super().__init__()
         self.args = args
@@ -505,6 +539,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._build_overview(), "概览")
         self.tabs.addTab(self._build_accounts(), "账号")
         self.tabs.addTab(self._build_usage(), "用量")
+        self.tabs.addTab(self._build_tasks(), "任务")
         self.tabs.addTab(self._build_logs(), "日志")
         self.tabs.addTab(self._build_settings(), "设置")
 
@@ -625,6 +660,22 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self.realm_filter)
         layout.addLayout(toolbar)
 
+        # Transfer actions live on their own row: they move the whole pool,
+        # not one account, so they should not sit among the per-account tools.
+        transfer = QHBoxLayout()
+        self.export_accounts_button = QPushButton("导出账号")
+        self.export_accounts_button.setProperty("variant", "secondary")
+        self.export_accounts_button.clicked.connect(self.do_export_accounts)
+        self.import_accounts_button = QPushButton("导入账号")
+        self.import_accounts_button.setProperty("variant", "secondary")
+        self.import_accounts_button.clicked.connect(self.do_import_accounts)
+        transfer.addWidget(self.export_accounts_button)
+        transfer.addWidget(self.import_accounts_button)
+        transfer.addWidget(hint_label(
+            "用于备份或换机迁移；导出文件含明文凭证，注意保管。"))
+        transfer.addStretch(1)
+        layout.addLayout(transfer)
+
         self.account_table = QTableWidget(0, 7)
         self.account_table.setHorizontalHeaderLabels(
             ["账号", "区域", "状态", "有效期", "额度", "请求", "Token"])
@@ -711,8 +762,73 @@ class MainWindow(QMainWindow):
         models.body.addWidget(self.model_table)
         layout.addWidget(models, 1)
 
+        recent = Panel("最近请求")
+        self.recent_table = QTableWidget(0, 8)
+        self.recent_table.setHorizontalHeaderLabels(
+            ["时间", "模型", "账号", "模式", "耗时", "首字", "速度", "总 Token"])
+        self.recent_table.verticalHeader().setVisible(False)
+        self.recent_table.setAlternatingRowColors(True)
+        self.recent_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.recent_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        rheader = self.recent_table.horizontalHeader()
+        rheader.setSectionResizeMode(1, QHeaderView.Stretch)
+        for column in (0, 2, 3, 4, 5, 6, 7):
+            rheader.setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        recent.body.addWidget(self.recent_table)
+        layout.addWidget(recent, 2)
+
         self.usage_hint = hint_label("")
         layout.addWidget(self.usage_hint)
+        return page
+
+    # ------------------------------------------------------------------- logs
+    # ------------------------------------------------------------------ tasks
+    def _build_tasks(self):
+        """Scheduler panel: what runs, when, and what it did last time.
+
+        The daily check-in / growth tasks are a domestic-realm feature; for an
+        international account the scheduler only keeps tokens alive. The panel
+        says so rather than showing an empty list.
+        """
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(4, 10, 4, 4)
+        layout.setSpacing(12)
+
+        controls = Panel("定时任务")
+        self.task_state = QLabel("调度器未启动（服务未运行）")
+        self.task_state.setWordWrap(True)
+        controls.body.addWidget(self.task_state)
+        self.task_mode = hint_label("")
+        controls.body.addWidget(self.task_mode)
+
+        buttons = QHBoxLayout()
+        self.scheduler_toggle_button = QPushButton("启用 / 暂停")
+        self.scheduler_toggle_button.setProperty("variant", "secondary")
+        self.scheduler_toggle_button.clicked.connect(self.do_toggle_scheduler)
+        self.run_tasks_button = QPushButton("立即执行一次")
+        self.run_tasks_button.clicked.connect(self.do_run_tasks_now)
+        self.refresh_tasks_button = QPushButton("刷新")
+        self.refresh_tasks_button.setProperty("variant", "secondary")
+        self.refresh_tasks_button.clicked.connect(self.refresh_tasks)
+        buttons.addWidget(self.scheduler_toggle_button)
+        buttons.addWidget(self.run_tasks_button)
+        buttons.addStretch(1)
+        buttons.addWidget(self.refresh_tasks_button)
+        controls.body.addLayout(buttons)
+        controls.body.addWidget(hint_label(
+            "国内版账号会按排程自动签到、领取积分与派出猫猫旅行；"
+            "国际版账号只做令牌保活。全部操作走你自己的账号，"
+            "程序已内置防风控间隔。"))
+        layout.addWidget(controls)
+
+        history = Panel("执行记录")
+        self.task_log = QPlainTextEdit()
+        self.task_log.setObjectName("LogView")
+        self.task_log.setReadOnly(True)
+        self.task_log.setMaximumBlockCount(3000)
+        history.body.addWidget(self.task_log)
+        layout.addWidget(history, 1)
         return page
 
     # ------------------------------------------------------------------- logs
@@ -747,8 +863,12 @@ class MainWindow(QMainWindow):
         clear = QPushButton("清空")
         clear.setProperty("variant", "secondary")
         clear.clicked.connect(self.do_clear_logs)
+        export_logs = QPushButton("导出")
+        export_logs.setProperty("variant", "secondary")
+        export_logs.clicked.connect(self.do_export_logs)
         toolbar.addWidget(refresh)
         toolbar.addWidget(clear)
+        toolbar.addWidget(export_logs)
         toolbar.addStretch(1)
         layout.addLayout(toolbar)
 
@@ -782,12 +902,60 @@ class MainWindow(QMainWindow):
         row.addStretch(1)
         listen.body.addLayout(row)
         self.lan_check = QCheckBox("允许局域网访问（0.0.0.0，自动生成 API Key）")
-        self.lan_check.toggled.connect(
-            lambda on: self.regen_key_button.setEnabled(bool(on)))
+        self.lan_check.toggled.connect(self._on_lan_toggled)
         listen.body.addWidget(self.lan_check)
         listen.body.addWidget(hint_label(
-            "仅本机访问时无需 API Key；开放局域网后客户端必须携带 Key。"))
+            "仅本机访问时默认不校验 API Key；开放局域网后强制要求 Key。"))
         layout.addWidget(listen)
+
+        # ---- API key management ----
+        keys = Panel("API Key")
+        self.require_local_key_check = QCheckBox(
+            "本机也要求 API Key（默认关闭，本机客户端无需配置）")
+        keys.body.addWidget(self.require_local_key_check)
+        keys.body.addWidget(hint_label(
+            "关闭时：本机请求不校验 Key，但客户端填了下面任何一个 Key 也照样能用 —— "
+            "有些 Agent 客户端强制要求填写 Key 字段，填上即可。"))
+
+        self.key_table = QTableWidget(0, 3)
+        self.key_table.setHorizontalHeaderLabels(["名称", "Key", "状态"])
+        self.key_table.verticalHeader().setVisible(False)
+        self.key_table.setAlternatingRowColors(True)
+        self.key_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.key_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.key_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.key_table.setMaximumHeight(150)
+        kheader = self.key_table.horizontalHeader()
+        kheader.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        kheader.setSectionResizeMode(1, QHeaderView.Stretch)
+        kheader.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        keys.body.addWidget(self.key_table)
+
+        key_actions = QHBoxLayout()
+        self.new_key_button = QPushButton("新建 Key")
+        self.new_key_button.clicked.connect(self.do_new_key)
+        self.copy_key_button = QPushButton("复制选中")
+        self.copy_key_button.setProperty("variant", "secondary")
+        self.copy_key_button.clicked.connect(self.do_copy_key)
+        self.toggle_key_button = QPushButton("启用 / 停用")
+        self.toggle_key_button.setProperty("variant", "secondary")
+        self.toggle_key_button.clicked.connect(self.do_toggle_key)
+        self.delete_key_button = QPushButton("删除")
+        self.delete_key_button.setProperty("variant", "danger")
+        self.delete_key_button.clicked.connect(self.do_delete_key)
+        self.regen_key_button = QPushButton("重新生成局域网 Key")
+        self.regen_key_button.setProperty("variant", "secondary")
+        self.regen_key_button.clicked.connect(self.do_regen_key)
+        for button in (self.new_key_button, self.copy_key_button,
+                       self.toggle_key_button, self.delete_key_button):
+            key_actions.addWidget(button)
+        key_actions.addStretch(1)
+        key_actions.addWidget(self.regen_key_button)
+        keys.body.addLayout(key_actions)
+
+        self.key_hint = hint_label("")
+        keys.body.addWidget(self.key_hint)
+        layout.addWidget(keys)
 
         boot = Panel("启动")
         self.autostart_check = QCheckBox("开机自动启动（当前用户，无需管理员权限）")
@@ -802,6 +970,38 @@ class MainWindow(QMainWindow):
         self.open_dash_check = QCheckBox("启动服务后自动打开网页面板")
         boot.body.addWidget(self.open_dash_check)
         layout.addWidget(boot)
+
+        # ---- panel password ----
+        panel = Panel("网页面板密码")
+        panel.body.addWidget(hint_label(
+            "网页面板是浏览器里的备用管理界面（比这个窗口功能更全）。"
+            "默认密码是 admin。"))
+        self.panel_pwd_status = hint_label("")
+        panel.body.addWidget(self.panel_pwd_status)
+        pwd_row = QHBoxLayout()
+        self.new_pwd_edit = QLineEdit()
+        self.new_pwd_edit.setEchoMode(QLineEdit.Password)
+        self.new_pwd_edit.setPlaceholderText("新密码")
+        self.new_pwd_confirm = QLineEdit()
+        self.new_pwd_confirm.setEchoMode(QLineEdit.Password)
+        self.new_pwd_confirm.setPlaceholderText("再输一次")
+        self.set_pwd_button = QPushButton("修改密码")
+        self.set_pwd_button.clicked.connect(self.do_set_panel_password)
+        pwd_row.addWidget(self.new_pwd_edit, 1)
+        pwd_row.addWidget(self.new_pwd_confirm, 1)
+        pwd_row.addWidget(self.set_pwd_button)
+        panel.body.addLayout(pwd_row)
+        self.reset_pwd_button = QPushButton("重置为默认密码 admin")
+        self.reset_pwd_button.setProperty("variant", "secondary")
+        self.reset_pwd_button.clicked.connect(self.do_reset_panel_password)
+        reset_row = QHBoxLayout()
+        reset_row.addWidget(self.reset_pwd_button)
+        reset_row.addStretch(1)
+        panel.body.addLayout(reset_row)
+        panel.body.addWidget(hint_label(
+            "忘记密码时：本窗口可以随时重置（不需要旧密码），"
+            "因为能打开这个窗口就说明你能访问本机数据目录。"))
+        layout.addWidget(panel)
 
         advanced = Panel("高级")
         advanced.body.addWidget(QLabel("默认 system 提示词（客户端未提供时补上）"))
@@ -880,9 +1080,16 @@ class MainWindow(QMainWindow):
         self.logs_timer.timeout.connect(self.refresh_logs)
         self.logs_timer.start(LOGS_INTERVAL_MS)
 
+        # Scheduler state changes slowly (hourly at most), so a slow poll is
+        # enough; it is refreshed immediately after any manual action.
+        self.tasks_timer = QTimer(self)
+        self.tasks_timer.timeout.connect(self.refresh_tasks)
+        self.tasks_timer.start(15000)
+
         self.refresh_status()
         self.refresh_accounts()
         self.refresh_usage()
+        self.refresh_tasks()
         self.refresh_logs(True)
 
     # ----------------------------------------------------------------- helpers
@@ -964,6 +1171,7 @@ class MainWindow(QMainWindow):
         prefs["start_minimized"] = self.start_min_check.isChecked()
         prefs["autostart_start"] = self.auto_start_check.isChecked()
         prefs["open_dashboard_on_start"] = self.open_dash_check.isChecked()
+        prefs["require_local_key"] = self.require_local_key_check.isChecked()
         prefs["user_agent"] = self.ua_edit.text().strip()
         prompt = self.prompt_edit.toPlainText().strip()
         prefs["system_prompt"] = prompt or wb_proxy.DEFAULT_SYSTEM_PROMPT
@@ -972,6 +1180,8 @@ class MainWindow(QMainWindow):
     def _load_prefs_into_ui(self):
         self.port_spin.setValue(int(self.prefs.get("port", 8788)))
         self.lan_check.setChecked(bool(self.prefs.get("lan")))
+        self.require_local_key_check.setChecked(
+            bool(self.prefs.get("require_local_key")))
         self.start_min_check.setChecked(bool(self.prefs.get("start_minimized")))
         self.auto_start_check.setChecked(bool(self.prefs.get("autostart_start")))
         self.open_dash_check.setChecked(
@@ -985,6 +1195,8 @@ class MainWindow(QMainWindow):
         self.autostart_check.setChecked(wb_autostart.is_enabled())
         self.autostart_check.blockSignals(False)
         self._refresh_autostart_status()
+        self.refresh_keys()
+        self.refresh_panel_password_state()
 
     def _refresh_autostart_status(self):
         info = wb_autostart.status()
@@ -1015,7 +1227,7 @@ class MainWindow(QMainWindow):
             if not silent and self.open_dash_check.isChecked():
                 self.open_panel()
         elif not silent:
-            QMessageBox.critical(self, "启动失败", message)
+            self.fail("启动失败", message)
 
     @Slot()
     def do_stop(self):
@@ -1036,27 +1248,27 @@ class MainWindow(QMainWindow):
     def open_panel(self):
         url = self.gateway.base_url()
         if not QDesktopServices.openUrl(QUrl(url)):
-            QMessageBox.warning(self, "无法打开浏览器", "请手动访问：%s" % url)
+            self.warn("无法打开浏览器", "请手动访问：%s" % url)
 
     @Slot()
     def open_data_dir(self):
         path = wb_runtime.data_dir()
         if not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
-            QMessageBox.warning(self, "无法打开目录", path)
+            self.warn("无法打开目录", path)
 
     @Slot()
     def do_regen_key(self):
         """Mint a fresh LAN key (only meaningful when listening on all interfaces)."""
         if not self.lan_check.isChecked():
-            QMessageBox.information(
+            self.info(
                 self, "仅本机模式",
-                "本机模式不需要 API Key。\n\n"
-                "如需 Key，请先勾选「允许局域网访问」并保存设置。")
+                "局域网 Key 只在开启「允许局域网访问」时使用。\n\n"
+                "本机模式若需要 Key（例如某个客户端强制要求填写），"
+                "请用上面的「新建 Key」。")
             return
-        if QMessageBox.question(
-                self, "重新生成 Key",
-                "重新生成后，所有客户端都要更换新 Key。\n\n确定继续？"
-        ) != QMessageBox.Yes:
+        if not self.ask(
+                "重新生成 Key",
+                "重新生成后，所有客户端都要更换新 Key。\n\n确定继续？"):
             return
         import wb_settings
         try:
@@ -1066,12 +1278,263 @@ class MainWindow(QMainWindow):
             key, _ = wb_settings.ensure_launcher_key(wb_proxy.ACCOUNTS_DIR)
             wb_proxy.API_KEY = key
             self.set_status("已生成新的 API Key")
-            QMessageBox.information(
+            self.info(
                 self, "新 Key 已生成",
                 "新 Key：\n\n%s\n\n重启服务后生效，请同步更新客户端配置。" % key)
             self.refresh_status()
         except Exception as exc:
-            QMessageBox.critical(self, "生成失败", str(exc))
+            self.fail("生成失败", str(exc))
+
+    # ------------------------------------------------------------- key manager
+    def _on_lan_toggled(self, _checked):
+        """Keep the key controls consistent with the listening mode."""
+        self.refresh_keys()
+        self.refresh_status()
+
+    def _mask_key(self, key):
+        """Show enough of a key to recognise it without exposing all of it."""
+        key = key or ""
+        if len(key) <= 10:
+            return key
+        return key[:6] + "…" + key[-4:]
+
+    @Slot()
+    def refresh_keys(self):
+        """Render the configured keys plus the generated LAN key."""
+        table = self.key_table
+        table.setRowCount(0)
+        try:
+            entries = list(wb_proxy.configured_keys())
+        except Exception:
+            entries = []
+
+        rows = []
+        for entry in entries:
+            rows.append((entry.get("id") or "", entry.get("name") or "未命名",
+                         entry.get("key") or "", bool(entry.get("enabled", True)),
+                         False))
+        # The launcher key is generated by LAN mode and is not part of the
+        # panel list, so surface it here too - otherwise the key printed at
+        # startup has no visible home in the UI.
+        try:
+            launcher = wb_proxy.API_KEY or ""
+        except Exception:
+            launcher = ""
+        if launcher and not any(r[2] == launcher for r in rows):
+            rows.append(("__launcher__", "局域网自动生成", launcher, True, True))
+
+        table.setRowCount(len(rows))
+        for index, (kid, name, key, enabled, is_launcher) in enumerate(rows):
+            cells = [name, self._mask_key(key),
+                     "启用" if enabled else "已停用"]
+            for column, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                if column == 0:
+                    item.setData(Qt.UserRole, kid)
+                    item.setData(Qt.UserRole + 1, key)
+                    item.setData(Qt.UserRole + 2, is_launcher)
+                if not enabled:
+                    item.setForeground(QColor(theme.FG_MUTED))
+                elif column == 2:
+                    item.setForeground(QColor(theme.SUCCESS))
+                if column == 1:
+                    item.setToolTip("点「复制选中」可复制完整 Key")
+                table.setItem(index, column, item)
+
+        lan = self.lan_check.isChecked()
+        if lan:
+            self.key_hint.setText(
+                "当前是局域网模式：所有客户端必须携带 Key。"
+                "「局域网自动生成」那个就是启动时提示的 Key，可复制给客户端。")
+        elif self.require_local_key_check.isChecked():
+            self.key_hint.setText(
+                "已开启「本机也要求 Key」：本机客户端必须携带下面任一启用的 Key。")
+        elif rows:
+            self.key_hint.setText(
+                "本机模式默认不校验 Key。下面这些 Key 仍然有效 —— "
+                "客户端若强制要求填 Key，把任意一个填进去即可。")
+        else:
+            self.key_hint.setText(
+                "本机模式不需要 Key。若某个客户端强制要求填写，"
+                "点「新建 Key」生成一个填进去即可。")
+        self.regen_key_button.setEnabled(lan)
+
+    def _selected_key(self):
+        row = self.key_table.currentRow()
+        if row < 0:
+            self.info("未选择", "请先在列表里选中一个 Key。")
+            return None
+        item = self.key_table.item(row, 0)
+        if item is None:
+            return None
+        return {
+            "id": item.data(Qt.UserRole),
+            "key": item.data(Qt.UserRole + 1),
+            "launcher": bool(item.data(Qt.UserRole + 2)),
+        }
+
+    @Slot()
+    def do_new_key(self):
+        """Create a key so a client that demands one has something to carry."""
+        name, ok = self.ask_text(
+            "新建 Key", "给这个 Key 起个名字（例如客户端名称）：",
+            default="客户端")
+        if not ok:
+            return
+        import secrets
+        key = "wb-" + secrets.token_urlsafe(24)
+        try:
+            entries = list(wb_proxy.configured_keys())
+            entries.append({
+                "id": secrets.token_hex(6),
+                "name": (name or "").strip() or "未命名",
+                "key": key, "realm": "", "enabled": True,
+            })
+            wb_settings.set_api_keys(wb_proxy.ACCOUNTS_DIR, entries)
+        except Exception as exc:
+            self.fail("创建失败", str(exc))
+            return
+        self.refresh_keys()
+        self.refresh_status()
+        self.set_status("已新建 Key")
+        self.show_new_key(key)
+
+    def show_new_key(self, key):
+        """Show a freshly created key with a one-click copy.
+
+        Split out from :meth:`do_new_key` so tests can drive key creation
+        without a modal dialog blocking them.
+        """
+        box = QMessageBox(self)
+        box.setWindowTitle("新 Key 已创建")
+        box.setText("把这个 Key 填进客户端：")
+        box.setInformativeText(key)
+        box.setStandardButtons(QMessageBox.Ok)
+        copy_btn = box.addButton("复制", QMessageBox.ActionRole)
+        box.exec()
+        if box.clickedButton() is copy_btn:
+            QApplication.clipboard().setText(key)
+
+    @Slot()
+    def do_copy_key(self):
+        selected = self._selected_key()
+        if not selected or not selected["key"]:
+            return
+        QApplication.clipboard().setText(selected["key"])
+        self.set_status("Key 已复制到剪贴板")
+
+    @Slot()
+    def do_toggle_key(self):
+        selected = self._selected_key()
+        if not selected:
+            return
+        if selected["launcher"]:
+            self.info(
+                self, "局域网 Key",
+                "这是局域网模式自动生成的 Key，不能单独停用。\n\n"
+                "要更换它请点「重新生成局域网 Key」。")
+            return
+        try:
+            entries = list(wb_proxy.configured_keys())
+            for entry in entries:
+                if entry.get("id") == selected["id"]:
+                    entry["enabled"] = not entry.get("enabled", True)
+            wb_settings.set_api_keys(wb_proxy.ACCOUNTS_DIR, entries)
+        except Exception as exc:
+            self.fail("操作失败", str(exc))
+            return
+        self.refresh_keys()
+        self.refresh_status()
+
+    @Slot()
+    def do_delete_key(self):
+        selected = self._selected_key()
+        if not selected:
+            return
+        if selected["launcher"]:
+            self.info(
+                self, "局域网 Key",
+                "这是局域网模式自动生成的 Key。\n\n"
+                "关闭「允许局域网访问」即可让它失效。")
+            return
+        if not self.ask(
+                "确认删除",
+                "删除后使用这个 Key 的客户端会立刻失去访问权限。\n\n确定删除？"):
+            return
+        try:
+            entries = [e for e in wb_proxy.configured_keys()
+                       if e.get("id") != selected["id"]]
+            wb_settings.set_api_keys(wb_proxy.ACCOUNTS_DIR, entries)
+        except Exception as exc:
+            self.fail("删除失败", str(exc))
+            return
+        self.refresh_keys()
+        self.refresh_status()
+        self.set_status("已删除 Key")
+
+    # -------------------------------------------------------- panel password
+    @Slot()
+    def refresh_panel_password_state(self):
+        try:
+            is_default = wb_settings.panel_password_is_default(
+                wb_proxy.ACCOUNTS_DIR)
+        except Exception:
+            is_default = True
+        if is_default:
+            self.panel_pwd_status.setText(
+                "当前是默认密码 admin —— 建议改成自己的密码。")
+        else:
+            self.panel_pwd_status.setText("当前已设置自定义密码。")
+
+    @Slot()
+    def do_set_panel_password(self):
+        new = self.new_pwd_edit.text()
+        confirm = self.new_pwd_confirm.text()
+        if not new:
+            self.info("请输入密码", "新密码不能为空。")
+            return
+        if new != confirm:
+            self.warn("两次输入不一致", "请重新输入两遍相同的新密码。")
+            return
+        if len(new) < 4:
+            self.info("密码太短", "请至少使用 4 个字符。")
+            return
+        try:
+            wb_settings.set_panel_password(wb_proxy.ACCOUNTS_DIR, new)
+        except Exception as exc:
+            self.fail("修改失败", str(exc))
+            return
+        self.new_pwd_edit.clear()
+        self.new_pwd_confirm.clear()
+        self.refresh_panel_password_state()
+        self.set_status("网页面板密码已修改")
+        self.info("已修改",
+                                "网页面板密码已更新。浏览器里需要重新登录。")
+
+    @Slot()
+    def do_reset_panel_password(self):
+        """Restore the default password without knowing the old one.
+
+        The panel's own change-password flow requires the current password,
+        which is useless to someone who has forgotten it. Anyone who can open
+        this window already has local access to the data directory, so the
+        password protects the browser route, not this one.
+        """
+        if not self.ask(
+                "重置密码",
+                "把网页面板密码重置为默认的 admin？\n\n"
+                "重置后浏览器里用 admin 即可登录。"):
+            return
+        try:
+            wb_settings.set_panel_password(
+                wb_proxy.ACCOUNTS_DIR, wb_settings.DEFAULT_PANEL_PASSWORD)
+        except Exception as exc:
+            self.fail("重置失败", str(exc))
+            return
+        self.refresh_panel_password_state()
+        self.set_status("已重置为默认密码 admin")
+        self.info("已重置",
+                                "网页面板密码已重置为 admin。")
 
     # -------------------------------------------------------------- accounts
     @Slot()
@@ -1082,7 +1545,7 @@ class MainWindow(QMainWindow):
     @Slot()
     def do_add_account(self):
         if wb_proxy.POOL is None:
-            QMessageBox.information(
+            self.info(
                 self, "请先启动服务",
                 "添加账号需要先启动服务。\n\n点右上角「启动服务」后再试。")
             return
@@ -1100,18 +1563,18 @@ class MainWindow(QMainWindow):
         what the realm split exists to prevent.
         """
         if wb_proxy.POOL is None:
-            QMessageBox.information(self, "请先启动服务",
+            self.info("请先启动服务",
                                     "导入账号需要先启动服务。")
             return
         self.set_status("正在扫描桌面应用凭证…")
         self.run_async(wb_proxy.desktop_credential_scan, self._on_scan_done,
                        lambda msg: (self.set_status("扫描失败：%s" % msg),
-                                    QMessageBox.critical(self, "扫描失败", msg)))
+                                    self.fail("扫描失败", msg)))
 
     def _on_scan_done(self, found):
         if not found:
             self.set_status("未发现桌面应用凭证")
-            QMessageBox.information(
+            self.info(
                 self, "未找到凭证",
                 "本机没有找到 WorkBuddy 桌面应用的登录凭证。\n\n"
                 "可以改用「添加账号 (OAuth 授权)」，无需安装桌面应用。")
@@ -1181,14 +1644,14 @@ class MainWindow(QMainWindow):
                 if good:
                     self.set_status("已导入：%s" % "、".join(good))
                 if bad:
-                    QMessageBox.warning(self, "部分导入失败", "\n".join(bad))
+                    self.warn("部分导入失败", "\n".join(bad))
                 elif good:
-                    QMessageBox.information(self, "导入完成",
+                    self.info("导入完成",
                                             "已导入 %d 个账号：\n%s"
                                             % (len(good), "、".join(good)))
 
             self.run_async(work, done,
-                           lambda msg: QMessageBox.critical(self, "导入失败", msg))
+                           lambda msg: self.fail("导入失败", msg))
 
         import_button.clicked.connect(do_import)
         buttons.rejected.connect(dialog.reject)
@@ -1197,7 +1660,7 @@ class MainWindow(QMainWindow):
     @Slot()
     def do_fetch_credits(self):
         if wb_proxy.POOL is None or not wb_proxy.POOL.accounts:
-            QMessageBox.information(self, "没有账号", "请先添加账号。")
+            self.info("没有账号", "请先添加账号。")
             return
         self.set_status("正在查询额度…")
 
@@ -1224,7 +1687,7 @@ class MainWindow(QMainWindow):
     @Slot()
     def do_refresh_tokens(self):
         if wb_proxy.POOL is None or not wb_proxy.POOL.accounts:
-            QMessageBox.information(self, "没有账号", "请先添加账号。")
+            self.info("没有账号", "请先添加账号。")
             return
         self.set_status("正在刷新令牌…")
 
@@ -1249,7 +1712,7 @@ class MainWindow(QMainWindow):
     def _selected_uid(self):
         row = self.account_table.currentRow()
         if row < 0:
-            QMessageBox.information(self, "未选择", "请先在列表里选中一个账号。")
+            self.info("未选择", "请先在列表里选中一个账号。")
             return None
         item = self.account_table.item(row, 0)
         return item.data(Qt.UserRole) if item else None
@@ -1272,10 +1735,9 @@ class MainWindow(QMainWindow):
             return
         account = wb_proxy.POOL.get(uid)
         name = (account.nickname if account else uid[:8]) or uid[:8]
-        if QMessageBox.question(
-                self, "确认删除",
-                "确定删除账号 %s 吗？\n\n删除后需要重新登录才能恢复。" % name
-        ) != QMessageBox.Yes:
+        if not self.ask(
+                "确认删除",
+                "确定删除账号 %s 吗？\n\n删除后需要重新登录才能恢复。" % name):
             return
         wb_proxy.POOL.remove(uid)
         self.refresh_accounts()
@@ -1296,6 +1758,227 @@ class MainWindow(QMainWindow):
         self.log_view.clear()
         self.refresh_logs(True)
 
+    @staticmethod
+    def _resolve_export_target(chosen):
+        """Validate a path the user picked in a save dialog.
+
+        The picker already decided where the file goes, so this is not a
+        trust boundary - it exists so a malformed value produces a clear error
+        rather than a file in an unexpected place. Returns (path, error).
+        """
+        if not chosen:
+            return None, "未选择文件"
+        normalized = os.path.normpath(chosen)
+        if ".." in normalized.split(os.sep):
+            return None, "路径中不允许包含 .."
+        target = os.path.realpath(normalized)
+        if not os.path.isabs(target):
+            return None, "请选择绝对路径"
+        parent = os.path.dirname(target)
+        if not os.path.isdir(parent):
+            return None, "目标文件夹不存在：%s" % parent
+        if os.path.isdir(target):
+            return None, "目标是一个文件夹，请指定文件名"
+        return target, ""
+
+    @staticmethod
+    def _write_export(path, text):
+        """Write an export file, creating it with os.open.
+
+        Uses os.open rather than the built-in open() so the destination is
+        explicit and the file is created with owner-only permissions on
+        platforms that honour them - these exports can carry credentials.
+        """
+        data = text.encode("utf-8")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            os.write(fd, data)
+        finally:
+            os.close(fd)
+
+    @Slot()
+    def do_export_logs(self):
+        """Save the in-memory log buffer to a text file."""
+        entries = wb_proxy.get_logs(limit=5000)
+        rows = entries.get("logs") or []
+        if not rows:
+            self.info("没有日志", "当前没有可导出的日志。")
+            return
+        default = os.path.join(
+            wb_runtime.data_dir(),
+            "wb-proxy-%s.log" % time.strftime("%Y%m%d-%H%M%S"))
+        chosen, _ = QFileDialog.getSaveFileName(
+            self, "导出日志", default, "日志文件 (*.log);;文本文件 (*.txt)")
+        target, problem = self._resolve_export_target(chosen)
+        if problem:
+            if chosen:
+                self.fail("路径无效", problem)
+            return
+        body = "".join("[%s] [%s] [%s] %s\n" % (
+            row.get("ts", ""), row.get("level", ""),
+            row.get("tag", ""), row.get("msg", "")) for row in rows)
+        try:
+            self._write_export(target, body)
+        except Exception as exc:
+            self.fail("导出失败", str(exc))
+            return
+        self.set_status("日志已导出")
+        self.info("导出完成", "已导出 %d 条日志到：\n\n%s" % (len(rows), target))
+
+    # ------------------------------------------------------- account transfer
+    @Slot()
+    def do_export_accounts(self):
+        """Write the account pool to a JSON document for backup or migration."""
+        pool = wb_proxy.POOL
+        if pool is None or not pool.accounts:
+            self.info("没有账号", "当前没有账号可导出。")
+            return
+        default = os.path.join(
+            wb_runtime.data_dir(),
+            "workbuddy-accounts-%s.json" % time.strftime("%Y%m%d-%H%M%S"))
+        chosen, _ = QFileDialog.getSaveFileName(
+            self, "导出账号", default, "JSON 文件 (*.json)")
+        target, problem = self._resolve_export_target(chosen)
+        if problem:
+            if chosen:
+                self.fail("路径无效", problem)
+            return
+        payload = {
+            "exported_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "count": len(pool.accounts),
+            "accounts": [account.to_dict() for account in pool.accounts],
+        }
+        body = json.dumps(payload, ensure_ascii=False, indent=2)
+        try:
+            self._write_export(target, body)
+        except Exception as exc:
+            self.fail("导出失败", str(exc))
+            return
+        self.set_status("已导出 %d 个账号" % len(pool.accounts))
+        # Say plainly that the file carries live credentials: it is the kind of
+        # file people mail to themselves without thinking.
+        self.warn("导出完成",
+                  "已导出 %d 个账号到：\n\n%s\n\n"
+                  "注意：文件里包含账号的登录凭证（明文），"
+                  "请勿分享或放进同步盘。" % (len(pool.accounts), target))
+
+    @Slot()
+    def do_import_accounts(self):
+        """Load an exported document, previewing what it would change first."""
+        if wb_proxy.POOL is None:
+            self.info("请先启动服务", "导入账号需要先启动服务。")
+            return
+        chosen, _ = QFileDialog.getOpenFileName(
+            self, "导入账号", wb_runtime.data_dir(), "JSON 文件 (*.json)")
+        if not chosen:
+            return
+        source = os.path.realpath(os.path.normpath(chosen))
+        if ".." in os.path.normpath(chosen).split(os.sep):
+            self.fail("路径无效", "路径中不允许包含 ..")
+            return
+        if not os.path.isfile(source):
+            self.fail("文件不存在", source)
+            return
+        if os.path.getsize(source) > 32 * 1024 * 1024:
+            self.fail("文件过大", "这个文件不像是账号导出文件。")
+            return
+        try:
+            with open(source, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception as exc:
+            self.fail("读取失败", str(exc))
+            return
+
+        rows = data.get("accounts") if isinstance(data, dict) else data
+        if not isinstance(rows, list) or not rows:
+            self.fail("格式不对",
+                      "这个文件里没有账号列表。\n\n"
+                      "请选择由本程序「导出账号」生成的文件。")
+            return
+
+        try:
+            preview = wb_proxy.POOL.preview_import_rows(rows)
+        except Exception as exc:
+            self.fail("预览失败", str(exc))
+            return
+
+        summary = ("将要导入 %d 个账号：\n\n"
+                   "  新增    %d 个\n"
+                   "  覆盖    %d 个\n"
+                   "  跳过    %d 个（已存在）\n"
+                   "  无效    %d 个\n\n"
+                   "导入后同名账号会被文件里的版本覆盖。确定继续？"
+                   % (len(rows), len(preview["added"]),
+                      len(preview["updated"]), len(preview["skipped"]),
+                      len(preview["invalid"])))
+        if not self.ask("确认导入", summary):
+            return
+
+        def work():
+            return wb_proxy.POOL.import_rows(rows, overwrite=True)
+
+        def done(result):
+            self.refresh_accounts()
+            added = len((result or {}).get("added") or [])
+            updated = len((result or {}).get("updated") or [])
+            self.set_status("已导入：新增 %d，覆盖 %d" % (added, updated))
+            self.info("导入完成",
+                      "新增 %d 个，覆盖 %d 个账号。" % (added, updated))
+
+        self.run_async(work, done, lambda msg: self.fail("导入失败", msg))
+
+    # ------------------------------------------------------------ tasks panel
+    @Slot()
+    def refresh_tasks(self):
+        """Show scheduler state and its recent runs."""
+        sched = getattr(wb_proxy, "SCHEDULER", None)
+        if sched is None:
+            self.task_state.setText("调度器未启动（服务未运行）")
+            self.task_log.clear()
+            return
+        try:
+            status = sched.status()
+        except Exception as exc:
+            self.task_state.setText("读取调度器状态失败：%s" % exc)
+            return
+        self.task_state.setText(
+            "状态：%s　·　上次运行：%s　·　下次运行：%s"
+            % ("已启用" if status.get("enabled") else "已暂停",
+               status.get("last_run_time") or "尚未运行",
+               status.get("next_run_time") or "待调度"))
+        self.task_mode.setText(status.get("mode") or "")
+        logs = status.get("logs") or []
+        self.task_log.setPlainText("\n".join(logs[-60:]) if logs
+                                   else "（暂无执行记录）")
+
+    @Slot()
+    def do_toggle_scheduler(self):
+        sched = getattr(wb_proxy, "SCHEDULER", None)
+        if sched is None:
+            self.info("服务未运行", "请先启动服务。")
+            return
+        try:
+            sched.enabled = not sched.enabled
+        except Exception as exc:
+            self.fail("操作失败", str(exc))
+            return
+        self.refresh_tasks()
+        self.set_status("定时任务已%s" % ("启用" if sched.enabled else "暂停"))
+
+    @Slot()
+    def do_run_tasks_now(self):
+        sched = getattr(wb_proxy, "SCHEDULER", None)
+        if sched is None:
+            self.info("服务未运行", "请先启动服务。")
+            return
+        try:
+            result = sched.trigger_now()
+        except Exception as exc:
+            self.fail("触发失败", str(exc))
+            return
+        self.set_status((result or {}).get("msg") or "已触发")
+        QTimer.singleShot(2000, self.refresh_tasks)
+
     # --------------------------------------------------------------- settings
     def do_toggle_autostart(self, checked):
         if checked:
@@ -1309,7 +1992,7 @@ class MainWindow(QMainWindow):
             self.autostart_check.blockSignals(True)
             self.autostart_check.setChecked(wb_autostart.is_enabled())
             self.autostart_check.blockSignals(False)
-            QMessageBox.critical(self, "开机自启", message)
+            self.fail("开机自启", message)
         self.set_status(message)
         self._refresh_autostart_status()
 
@@ -1320,7 +2003,7 @@ class MainWindow(QMainWindow):
         try:
             wb_gateway.save_prefs(self.gateway.prefs)
         except Exception as exc:
-            QMessageBox.critical(self, "保存失败", str(exc))
+            self.fail("保存失败", str(exc))
             return
         self.prefs = dict(self.gateway.prefs)
         if wb_autostart.is_enabled():
@@ -1329,7 +2012,7 @@ class MainWindow(QMainWindow):
         self._refresh_autostart_status()
         if self.gateway.is_running():
             self.set_status("设置已保存（监听改动需重启服务生效）")
-            QMessageBox.information(
+            self.info(
                 self, "已保存",
                 "设置已保存。\n\n监听地址与端口的改动需要重启服务后生效。")
         else:
@@ -1337,9 +2020,7 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def do_reset_settings(self):
-        if QMessageBox.question(
-                self, "恢复默认",
-                "确定把所有设置恢复为默认值吗？") != QMessageBox.Yes:
+        if not self.ask("恢复默认", "确定把所有设置恢复为默认值吗？"):
             return
         self.prefs = dict(wb_gateway.DEFAULTS)
         self.gateway.prefs.update(self.prefs)
@@ -1390,11 +2071,20 @@ class MainWindow(QMainWindow):
             self._num(errors), "有失败请求" if errors else "全部成功")
 
         self.access["url"].set_text("%s/v1" % status.get("url", ""))
+        # Report the key situation in terms of what a client must do, which is
+        # what the operator needs to know when wiring one up.
         key = status.get("api_key") or ""
-        self.access["key"].set_text(key if key else "(本机模式无需 Key)")
+        if status.get("lan"):
+            shown = key or "(尚未生成)"
+        elif status.get("auth_required"):
+            shown = key or "(已启用校验，但未设置 Key)"
+        elif key:
+            shown = "%s  (本机不强制，客户端可填)" % key
+        else:
+            shown = "(本机模式无需 Key)"
+        self.access["key"].set_text(shown)
         self.access["realm"].set_text(realm_label(wb_proxy.CURRENT_REALM))
         self.access["scheduler"].set_text(status.get("scheduler_next") or "未启用")
-        self.regen_key_button.setEnabled(self.lan_check.isChecked())
 
     @Slot()
     def refresh_accounts(self):
@@ -1506,6 +2196,38 @@ class MainWindow(QMainWindow):
         self.usage_hint.setText(
             "以上为 %s 的累计用量，数据来自 usage.jsonl，重启不丢。"
             % realm_label(wb_proxy.CURRENT_REALM))
+
+        # ---- recent requests ----
+        try:
+            recent = wb_proxy.usage_index().recent(
+                limit=80, realm=wb_proxy.CURRENT_REALM)[1]
+        except Exception:
+            recent = []
+        rtable = self.recent_table
+        rtable.setRowCount(len(recent))
+        for row_index, entry in enumerate(reversed(recent)):
+            stamp = (entry.get("iso") or "").replace("T", " ")[5:]
+            is_error = bool(entry.get("error"))
+            elapsed = entry.get("elapsed_ms")
+            ttft = entry.get("ttft_ms")
+            speed = entry.get("tokens_per_sec")
+            values = [
+                stamp,
+                entry.get("model") or "?",
+                (entry.get("account") or "—")[:8],
+                "失败" if is_error else ("流式" if entry.get("stream") else "非流式"),
+                self._num(elapsed) + " ms" if elapsed is not None else "—",
+                self._num(ttft) + " ms" if ttft is not None else "—",
+                "%.1f" % speed if speed else "—",
+                self._num(entry.get("total_tokens")),
+            ]
+            for column, text in enumerate(values):
+                item = QTableWidgetItem(text)
+                if is_error:
+                    item.setForeground(QColor(theme.DANGER))
+                elif column == 3:
+                    item.setForeground(QColor(theme.SUCCESS))
+                rtable.setItem(row_index, column, item)
 
     @Slot()
     def refresh_logs(self, force=False):

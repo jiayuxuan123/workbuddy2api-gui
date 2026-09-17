@@ -1788,6 +1788,25 @@ function panelNeedsLogin(){
   if(gate) gate.style.display = 'flex';
   const input = document.getElementById('panelPwdInput');
   if(input){ input.focus(); }
+  // Stop polling and drop the stale token. Without this, a session that
+  // expired (the server keeps panel sessions in memory, so restarting the
+  // gateway invalidates every browser) leaves the timers running: each tick
+  // fires a request that 401s, so the log fills with failures while the login
+  // box sits on top of the page.
+  panelStopPolling();
+}
+
+function panelStopPolling(){
+  PANEL_READY = false;
+  PANEL_TIMERS.forEach(t => clearInterval(t));
+  PANEL_TIMERS = [];
+  if(typeof logPollTimer !== 'undefined' && logPollTimer){
+    clearInterval(logPollTimer);
+    logPollTimer = null;
+  }
+  if(typeof logAutoRefresh !== 'undefined') logAutoRefresh = false;
+  PANEL_TOKEN = '';
+  try { sessionStorage.removeItem(PANEL_STORE); } catch(e) {}
 }
 
 function panelHideGate(){

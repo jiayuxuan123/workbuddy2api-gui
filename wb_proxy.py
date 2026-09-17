@@ -19,6 +19,7 @@ import json
 import os
 MAX_PAYLOAD_BYTES = int(os.environ.get("WB_MAX_PAYLOAD_BYTES", 50 * 1024 * 1024))  # 50MB limit
 import socket
+import ssl
 import sys
 import tempfile
 import threading
@@ -32,28 +33,15 @@ import wb_runtime
 import wb_settings
 import wb_usagelog
 CURRENT_REALM = os.environ.get("WB_PROXY_DEFAULT_REALM", "intl")
-def detect_model_realm(model_id):
-    if not model_id:
-        return CURRENT_REALM
-    m = str(model_id).lower()
-    intl_only = {
-        "gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
-        "gpt-5.5", "gpt-5.4", "gpt-5.3-codex", "gemini-3.5-flash"
-    }
-    if m in intl_only or any(m.startswith(p) for p in ("gpt-", "gemini-")):
-        return "intl"
-    cn_only = {
-        "deepseek-v4-pro", "minimax-m3", "minimax-m2.7", "minimax-m2.5",
-        "glm-5.3-flash", "glm-5.1", "glm-5.0-turbo", "glm-4.6v",
-        "kimi-k3-1", "kimi-k2.8-preview", "kimi-k2.7", "kimi-k2-thinking",
-        "hy3-x", "hy4-preview-dev", "hy4-preview-x"
-    }
-    if m in cn_only or any(m.startswith(p) for p in ("minimax-", "deepseek-v4-pro")):
-        return "cn"
-    return CURRENT_REALM
 # Models that exist on one side only. Everything else (deepseek-v4.1-flash,
 # hy3, glm-5.3 ...) is served by both exits, so it must not be treated as a
 # conflict.
+#
+# These two sets are the single source of truth for realm routing: both
+# detect_model_realm() and exclusive_realm() read them. They used to hold
+# separate hand-written lists, and the two drifted - glm-5v-turbo was listed as
+# domestic in one and treated as international by the other, so that model was
+# sent to the wrong exit and rejected upstream with an opaque 403.
 INTL_EXCLUSIVE_PREFIXES = ("gpt-", "gemini-")
 CN_EXCLUSIVE_PREFIXES = ("minimax-", "deepseek-v4-pro")
 INTL_EXCLUSIVE = {
@@ -62,9 +50,32 @@ INTL_EXCLUSIVE = {
 }
 CN_EXCLUSIVE = {
     "deepseek-v4-pro", "glm-5.3-flash", "glm-5.1", "glm-5v-turbo",
-    "kimi-k3-1", "kimi-k2.8-preview", "kimi-k2.7", "minimax-m3",
+    "glm-5.0-turbo", "glm-4.6v",
+    "kimi-k3-1", "kimi-k2.8-preview", "kimi-k2.7", "kimi-k2-thinking",
+    "minimax-m3", "minimax-m2.7", "minimax-m2.5",
     "hy3-x", "hy4-preview-dev", "hy4-preview-x",
 }
+
+
+def detect_model_realm(model_id):
+    """Which upstream exit serves this model.
+
+    Reads the shared realm sets so routing cannot disagree with the
+    cross-realm check in :func:`exclusive_realm`.
+    """
+    if not model_id:
+        return CURRENT_REALM
+    m = str(model_id).lower()
+    if m in INTL_EXCLUSIVE or any(m.startswith(p)
+                                 for p in INTL_EXCLUSIVE_PREFIXES):
+        return "intl"
+    if m in CN_EXCLUSIVE or any(m.startswith(p)
+                                for p in CN_EXCLUSIVE_PREFIXES):
+        return "cn"
+    # Served by both exits: keep it on whichever realm is currently selected.
+    return CURRENT_REALM
+
+
 def exclusive_realm(model_id):
     """"intl"/"cn" when only that exit serves the model, else ""."""
     if not model_id:
@@ -190,6 +201,11 @@ USAGE_FIELDS = ("prompt_tokens", "completion_tokens", "reasoning_tokens",
 # restart forces browsers to log in again.
 PANEL = wb_settings.PanelSessions()
 API_KEY_FILE_SET = False
+#: When True, /v1 calls from the loopback interface must also present a key.
+#: Off by default: a local client should not have to be configured just to
+#: reach a gateway on the same machine. Keys configured in the panel still
+#: work when this is off - they are accepted, just not demanded.
+API_KEY_LOCAL_REQUIRED = False
 def configured_keys():
     """Panel-managed API keys, always read fresh so panel edits apply at once."""
     try:
@@ -198,19 +214,35 @@ def configured_keys():
         log("could not read api keys: %s" % exc)
         return []
 def auth_required():
-    """Whether /v1 calls must present a key at all."""
+    """Whether /v1 calls must present a key at all.
+
+    A key is demanded when the operator turned auth off the loopback path
+    (``require_local_key``), or when the gateway is reachable from the network
+    (LAN mode always sets a launcher key). Otherwise loopback callers are
+    served without one.
+    """
     if wb_settings.auth_disabled(ACCOUNTS_DIR):
+        return False
+    if not API_KEY_LOCAL_REQUIRED:
         return False
     if any(entry.get("enabled") for entry in configured_keys()):
         return True
     return bool(API_KEY)
 def identify_key(supplied):
     """Return the key entry a caller used, or None when nothing matches.
-    Once the panel has at least one key, those keys are the only accepted
-    credentials - otherwise a launcher key left in a .bat file would silently
-    keep working after the panel was locked down.
+
+    Both key sources are accepted: keys managed in the panel, and the launcher
+    key that LAN mode generates and prints on startup.
+
+    The launcher key used to be dropped from the candidate list as soon as the
+    panel held any key, to stop a stale key in an old .bat from surviving a
+    lock-down. That also broke the combination LAN mode actually creates -
+    generated launcher key plus a key saved from the panel - because the key
+    the startup banner tells the user to paste was then rejected. Panel keys
+    remain the only *required* credential (see auth_required); this function
+    only decides whether a presented key is valid.
     """
-    extra = () if configured_keys() else (API_KEY,)
+    extra = (API_KEY,) if API_KEY else ()
     return wb_settings.match_api_key(ACCOUNTS_DIR, supplied, extra_keys=extra)
 def _empty_stats():
     return {"requests": 0, "errors": 0, "prompt_tokens": 0, "completion_tokens": 0,
@@ -1539,6 +1571,33 @@ def build_upstream_body(payload):
     if "stream_options" not in body:
         body["stream_options"] = {"include_usage": True}
     return body
+def _is_transient_network_error(exc):
+    """True for a fault that a retry can plausibly fix.
+
+    TLS handshake failures ("violation of protocol", UNEXPECTED_EOF), reset
+    connections and timeouts are routine against these upstreams - a CDN edge
+    drops the handshake under load, or the network blips. They say nothing
+    about the account, so they must not be charged to it.
+    """
+    if isinstance(exc, ssl.SSLError):
+        return True
+    if isinstance(exc, urllib.error.URLError):
+        # URLError wraps the underlying socket error; unwrap to classify it.
+        reason = getattr(exc, "reason", None)
+        if isinstance(reason, ssl.SSLError):
+            return True
+        return isinstance(reason, (TimeoutError, ConnectionResetError,
+                                   ConnectionAbortedError, OSError))
+    return isinstance(exc, (TimeoutError, ConnectionResetError,
+                            ConnectionAbortedError))
+
+
+#: Retries for a transient network fault on the chat path. Kept small and
+#: backed off: the point is to survive a blip, not to hammer a failing edge.
+CHAT_NETWORK_RETRIES = 3
+CHAT_RETRY_BACKOFF = 1.5
+
+
 def open_upstream(payload, session_key=None, target_realm=None):
     realm = target_realm or detect_model_realm(payload.get("model")) or CURRENT_REALM
     upstream_body = build_upstream_body(payload)
@@ -1570,29 +1629,56 @@ def open_upstream(payload, session_key=None, target_realm=None):
         if parsed.scheme != "https" or parsed.hostname not in UPSTREAM_HOSTS:
             raise RuntimeError(
                 "refusing unknown upstream host: %r" % parsed.hostname)
-        req = urllib.request.Request(chat_url, data=body, method="POST",
-                                     headers=account.headers(purpose="chat"))
-        try:
-            resp = urllib.request.urlopen(req, timeout=600)
-            account.clear_error()
-            return resp, account
-        except urllib.error.HTTPError as exc:
-            if exc.code in (401, 403, 429):
-                log("account %s rejected (HTTP %s), rotating" % (account.uid[:8], exc.code))
+
+        # Retry transient network faults on the same account before treating
+        # the request as failed. Previously a single TLS reset surfaced to the
+        # client as a 502 and cooled the account down for 60s, so one blip cost
+        # both the request and the capacity to serve the next one.
+        for attempt in range(1, CHAT_NETWORK_RETRIES + 1):
+            req = urllib.request.Request(chat_url, data=body, method="POST",
+                                         headers=account.headers(purpose="chat"))
+            try:
+                resp = urllib.request.urlopen(req, timeout=600)
+                account.clear_error()
+                return resp, account
+            except urllib.error.HTTPError as exc:
+                if exc.code in (401, 403, 429):
+                    log("account %s rejected (HTTP %s), rotating" % (account.uid[:8], exc.code))
+                    if session_key and POOL:
+                        POOL.affinity.unbind(session_key)
+                    account.note_error("HTTP %s" % exc.code,
+                                       cooldown=300 if exc.code == 429 else 60,
+                                       single_account=(total <= 1))
+                    last_error = exc
+                    break               # account-level: move to the next one
+                if exc.code >= 500 and attempt < CHAT_NETWORK_RETRIES:
+                    log("upstream HTTP %s, retry %d/%d"
+                        % (exc.code, attempt, CHAT_NETWORK_RETRIES))
+                    time.sleep(CHAT_RETRY_BACKOFF * attempt)
+                    continue
+                raise
+            except Exception as exc:
+                if _is_transient_network_error(exc) and attempt < CHAT_NETWORK_RETRIES:
+                    log("network fault (%s), retry %d/%d on the same account"
+                        % (exc, attempt, CHAT_NETWORK_RETRIES))
+                    time.sleep(CHAT_RETRY_BACKOFF * attempt)
+                    continue
+                if _is_transient_network_error(exc):
+                    # Retries exhausted: still a transport problem, not an
+                    # account problem. Rotate without a long cooldown so the
+                    # account stays available for the next request.
+                    log("network fault persisted after %d attempts (%s)"
+                        % (CHAT_NETWORK_RETRIES, exc))
+                    account.note_error("network: %s" % str(exc)[:100],
+                                       cooldown=5, single_account=(total <= 1))
+                    last_error = exc
+                    break
                 if session_key and POOL:
                     POOL.affinity.unbind(session_key)
-                account.note_error("HTTP %s" % exc.code,
-                                   cooldown=300 if exc.code == 429 else 60,
+                account.note_error(str(exc)[:120], cooldown=60,
                                    single_account=(total <= 1))
                 last_error = exc
-                continue
-            raise
-        except Exception as exc:
-            if session_key and POOL:
-                POOL.affinity.unbind(session_key)
-            account.note_error(str(exc)[:120], cooldown=60, single_account=(total <= 1))
-            last_error = exc
-            continue
+                break
     if last_error is not None:
         raise last_error
     raise RuntimeError(f"no usable account for realm '{realm}': all are disabled, cooling down, or expired")
@@ -2957,23 +3043,37 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/panel/login":
             client_ip = self.client_address[0] if hasattr(self, "client_address") and self.client_address else "127.0.0.1"
+            # Throttling exists to slow down a remote brute-force. Anyone who
+            # can reach the panel over loopback already has local access to
+            # this machine, so locking them out buys nothing and does real
+            # harm: a few typos lock the operator out of their own panel for a
+            # minute, and the reply says "invalid panel password" while the
+            # real reason is the cooldown - which reads as a forgotten
+            # password rather than a temporary block.
+            loopback = client_ip in ("127.0.0.1", "::1", "localhost")
             now = time.time()
-            with _login_lock:
-                _prune_login_attempts(now)
-                attempts = [t for t in _login_attempts.get(client_ip, []) if now - t < 60]
-                _login_attempts[client_ip] = attempts
-                if len(attempts) >= 5:
-                    wait_sec = int(60 - (now - attempts[0]))
-                    return self._error(429, f"too many login attempts, please wait {max(1, wait_sec)}s", "rate_limit_error")
+            if not loopback:
+                with _login_lock:
+                    _prune_login_attempts(now)
+                    attempts = [t for t in _login_attempts.get(client_ip, []) if now - t < 60]
+                    _login_attempts[client_ip] = attempts
+                    if len(attempts) >= 5:
+                        wait_sec = max(1, int(60 - (now - attempts[0])))
+                        return self._error(
+                            429,
+                            f"too many login attempts, please wait {wait_sec}s",
+                            "rate_limit_error")
             password = str(payload.get("password") or "")
             if not wb_settings.verify_panel_password(ACCOUNTS_DIR, password):
-                with _login_lock:
-                    _login_attempts.setdefault(client_ip, []).append(now)
-                # Small backoff delay to mitigate automated brute force
-                time.sleep(0.5)
+                if not loopback:
+                    with _login_lock:
+                        _login_attempts.setdefault(client_ip, []).append(now)
+                    # Small backoff delay to mitigate automated brute force
+                    time.sleep(0.5)
                 return self._error(401, "invalid panel password", "invalid_request_error")
-            with _login_lock:
-                _login_attempts.pop(client_ip, None)
+            if not loopback:
+                with _login_lock:
+                    _login_attempts.pop(client_ip, None)
             token = PANEL.create()
             return self._json(200, {
                 "ok": True,

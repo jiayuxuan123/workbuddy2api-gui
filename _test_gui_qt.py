@@ -113,10 +113,10 @@ def main():
 
     print("=== construction ===")
     check("window built", window is not None)
-    check("five tabs", window.tabs.count() == 5, str(window.tabs.count()))
+    check("six tabs", window.tabs.count() == 6, str(window.tabs.count()))
     titles = [window.tabs.tabText(i) for i in range(window.tabs.count())]
-    check("tab order 概览/账号/用量/日志/设置",
-          titles == ["概览", "账号", "用量", "日志", "设置"], str(titles))
+    check("tab order 概览/账号/用量/任务/日志/设置",
+          titles == ["概览", "账号", "用量", "任务", "日志", "设置"], str(titles))
     check("start enabled / stop disabled",
           window.start_button.isEnabled() and not window.stop_button.isEnabled())
     check("data dir is the scratch dir",

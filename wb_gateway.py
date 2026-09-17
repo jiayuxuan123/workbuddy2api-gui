@@ -40,6 +40,10 @@ DEFAULTS = {
     "port": 8788,
     "host": "127.0.0.1",
     "lan": False,
+    #: Demand an API key from loopback callers too. Off by default so a local
+    #: client needs no configuration; keys set in the panel still authenticate
+    #: either way, this only controls whether they are required.
+    "require_local_key": False,
     "system_prompt": wb_proxy.DEFAULT_SYSTEM_PROMPT,
     "user_agent": "",
     "autostart": False,
@@ -425,19 +429,36 @@ class Gateway(object):
         if ua:
             wb_accounts.USER_AGENT = ua
 
-        # LAN mode must never ship a guessable key: the gateway spends the
-        # account's own upstream quota, so a known default lets anyone on the
-        # network drain it. Generated once, then reused across restarts.
+        # API key policy.
+        #
+        # Loopback-only: no key by default. Several agent clients require an
+        # API key field and behave badly when it is empty, and a key that is
+        # never checked is worse than no key - it gives a false sense of
+        # protection. A key that exists in the panel settings is therefore
+        # ignored unless the operator explicitly asks for local auth.
+        #
+        # Listening on every interface: a key is mandatory and generated here.
+        # The gateway spends the account's own upstream quota, so a guessable
+        # default would let anyone on the network drain it. Generated once and
+        # reused across restarts so clients keep working.
         if self.prefs.get("lan"):
             key, created = wb_settings.ensure_launcher_key(wb_proxy.ACCOUNTS_DIR)
             wb_proxy.API_KEY = key
             wb_proxy.API_KEY_FILE_SET = not created
-        else:
-            # Loopback-only: a key is optional, but honour one saved in the
-            # panel so the dashboard and /v1 agree on what to expect.
+            wb_proxy.API_KEY_LOCAL_REQUIRED = True
+        elif self.prefs.get("require_local_key"):
             saved, is_set = wb_settings.api_key_override(wb_proxy.ACCOUNTS_DIR)
-            wb_proxy.API_KEY = saved if is_set else None
-            wb_proxy.API_KEY_FILE_SET = bool(is_set)
+            if not is_set or not saved:
+                # The switch is on but nothing is configured: mint one rather
+                # than silently running unauthenticated.
+                saved, _ = wb_settings.ensure_launcher_key(wb_proxy.ACCOUNTS_DIR)
+            wb_proxy.API_KEY = saved
+            wb_proxy.API_KEY_FILE_SET = True
+            wb_proxy.API_KEY_LOCAL_REQUIRED = True
+        else:
+            wb_proxy.API_KEY = None
+            wb_proxy.API_KEY_FILE_SET = False
+            wb_proxy.API_KEY_LOCAL_REQUIRED = False
 
         pool = wb_accounts.AccountPool(wb_proxy.ACCOUNTS_DIR, log=wb_proxy.log)
         pool.load()
