@@ -26,3 +26,5 @@ build-onefile/
 
 # The PyInstaller spec is source (it defines the bundle contract).
 !workbuddy2api.spec
+build-updater/
+dist-updater/
