@@ -1,0 +1,28 @@
+accounts/*.json
+!accounts/README.txt
+usage/*.jsonl
+usage/*.json
+!usage/README.txt
+python/
+*.zip
+__pycache__/
+*.py[cod]
+build/
+dist/
+.DS_Store
+Thumbs.db
+desktop.ini
+.mimosa/
+
+# Packaged output and the assembled delivery folder are build artifacts,
+# not sources: they are produced by pyinstaller + copy steps.
+deliver/
+dist-onefile/
+build-onefile/
+
+# PyInstaller scratch dirs (Qt builds are large)
+build/
+build-onefile/
+
+# The PyInstaller spec is source (it defines the bundle contract).
+!workbuddy2api.spec

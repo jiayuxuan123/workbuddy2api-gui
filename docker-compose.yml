@@ -1,0 +1,17 @@
+services:
+  wb-proxy:
+    build: .
+    image: ardeyouxipianyi/workbuddy2api-hub:latest
+    container_name: wb-proxy
+    restart: unless-stopped
+    ports:
+      - "8788:8788"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8788
+      # - API_KEY=your_api_key_here
+      - TZ=Asia/Shanghai
+    volumes:
+      # 持久化挂载账号凭证与用量流水
+      - ./accounts:/app/accounts
+      - ./usage:/app/usage
