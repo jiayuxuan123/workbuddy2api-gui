@@ -47,6 +47,13 @@ DEFAULTS = {
     "system_prompt": wb_proxy.DEFAULT_SYSTEM_PROMPT,
     "user_agent": "",
     "autostart": False,
+    #: Start listening as soon as the program opens. The GUI has a checkbox
+    #: for this, but the key was missing from DEFAULTS - save_prefs() builds
+    #: its payload from DEFAULTS and then overlays the caller's values, so
+    #: anything absent here was silently dropped and the setting never
+    #: survived a restart. Boot-time autostart therefore never began serving
+    #: and the user still had to open the window and press Start.
+    "autostart_start": False,
     "start_minimized": False,
     "minimize_to_tray": False,
     "open_dashboard_on_start": False,
