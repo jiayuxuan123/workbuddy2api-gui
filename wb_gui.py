@@ -144,17 +144,24 @@ def make_icon(size=64, color=None):
 # Reusable pieces
 # ---------------------------------------------------------------------------
 class StatCard(QFrame):
-    """A titled number card for the overview row."""
+    """A titled number card for the overview row.
+
+    Deliberately plain: the title is small and dim, the number is the only
+    large element. Earlier versions tinted each number a different colour
+    (green/blue/purple/red across five cards), which read as decoration rather
+    than information. Colour is now reserved for state - a running service, a
+    failure count - and everything else is normal text.
+    """
 
     def __init__(self, title, tone=None, parent=None):
         super().__init__(parent)
         self.setObjectName("Card")
-        self.setMinimumHeight(86)
+        self.setMinimumHeight(78)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(15, 12, 15, 12)
-        layout.setSpacing(3)
+        layout.setContentsMargins(16, 12, 16, 12)
+        layout.setSpacing(2)
 
         self.title = QLabel(title)
         self.title.setObjectName("CardTitle")
@@ -163,17 +170,24 @@ class StatCard(QFrame):
         self.value = QLabel("—")
         self.value.setObjectName("CardValue")
         if tone:
+            # Retained so callers keep working, but only "danger" still tints:
+            # a non-zero failure count is the one number worth colouring.
             self.value.setProperty("tone", tone)
         layout.addWidget(self.value)
 
         self.sub = QLabel("")
         self.sub.setObjectName("CardSub")
+        self.sub.hide()          # an empty label would still draw its background
         layout.addWidget(self.sub)
 
     def set_value(self, text, sub=None):
         self.value.setText(str(text))
         if sub is not None:
-            self.sub.setText(str(sub))
+            text = str(sub)
+            self.sub.setText(text)
+            # Hide rather than leave a blank line, so a card without a subtitle
+            # does not show a stray rule under the number.
+            self.sub.setVisible(bool(text))
 
 
 class Panel(QFrame):
@@ -199,37 +213,53 @@ def hint_label(text="", warn=False):
 
 
 class ReadonlyField(QWidget):
-    """A labelled read-only value with a copy button."""
+    """A labelled read-only value with a copy action.
+
+    Rendered as a small dim label above the value rather than as a full-width
+    disabled input. The earlier version drew a bordered box exactly like an
+    editable field, which made a screen of these look like an unfinished form -
+    the value read as "you could type here but the app will not let you".
+    Text plus a small label says "this is information" at a glance.
+    """
 
     def __init__(self, label, parent=None):
         super().__init__(parent)
-        layout = QHBoxLayout(self)
+        layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(9)
+        layout.setSpacing(2)
 
         self.label = QLabel(label)
-        self.label.setFixedWidth(150)
-        self.field = QLineEdit()
-        self.field.setReadOnly(True)
-        self.field.setFont(QFont("Cascadia Mono", 9))
+        self.label.setObjectName("FieldLabel")
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+
+        self.value = QLabel("")
+        self.value.setObjectName("FieldValue")
+        self.value.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.value.setWordWrap(False)
+
         self.copy_button = QPushButton("复制")
-        self.copy_button.setProperty("variant", "secondary")
-        self.copy_button.setFixedWidth(62)
+        self.copy_button.setProperty("variant", "link")
         self.copy_button.clicked.connect(self._copy)
 
+        row.addWidget(self.value, 1)
+        row.addWidget(self.copy_button)
+
         layout.addWidget(self.label)
-        layout.addWidget(self.field, 1)
-        layout.addWidget(self.copy_button)
+        layout.addLayout(row)
 
     def set_text(self, text):
-        if self.field.text() != (text or ""):
-            self.field.setText(text or "")
+        text = text or ""
+        if self.value.text() != text:
+            self.value.setText(text)
 
     def text(self):
-        return self.field.text()
+        return self.value.text()
 
     def _copy(self):
-        QApplication.clipboard().setText(self.field.text())
+        QApplication.clipboard().setText(self.value.text())
 
 
 # ---------------------------------------------------------------------------
@@ -760,11 +790,10 @@ class MainWindow(QMainWindow):
             title.setObjectName("CardTitle")
             value = QLabel("—")
             value.setObjectName("CardValue")
-            value.setStyleSheet("font-size: 13pt;")
-            if key == "reasoning_tokens":
-                value.setProperty("tone", "think")
-            elif key == "total_tokens":
-                value.setProperty("tone", "accent")
+            value.setStyleSheet("font-size: 13pt; background: transparent;")
+            # Every figure is the same colour on purpose: tinting "thinking"
+            # purple and "total" blue made six numbers compete for attention
+            # and none of them mean anything different to the reader.
             grid.addWidget(title, 0, index)
             grid.addWidget(value, 1, index)
             self.usage_values[key] = value

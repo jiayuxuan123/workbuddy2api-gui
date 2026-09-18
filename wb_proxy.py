@@ -316,6 +316,19 @@ def _extract_usage(usage):
         "total_tokens": usage.get("total_tokens") or 0,
         "credit": usage.get("credit") or 0,
     }
+def realm_filter(value=None):
+    """Normalise a realm filter for the usage readers.
+
+    Returns a concrete realm ("intl"/"cn") when the caller wants one side, or
+    "" when they want everything. ``auto`` is a routing mode rather than a
+    realm, so it means "all" - treating it as a realm name matched no rows and
+    made every statistic read zero whenever auto routing was active.
+    """
+    if value in ("intl", "cn"):
+        return value
+    return ""
+
+
 def row_matches_realm(row, realm):
     """Whether a usage row belongs to the realm being viewed.
 
@@ -529,6 +542,7 @@ def _pct(values, q):
     return ordered[max(0, min(len(ordered) - 1, idx))]
 def perf_stats(sample=5000, realm=None):
     """Latency percentiles + derived rates, computed from the JSONL log."""
+    realm = realm_filter(realm)
     ttfts, gens, walls, rates, hits, tok_rates = [], [], [], [], [], []
     total = ok = err = 0
     # 按模型聚合性能指标
@@ -606,7 +620,7 @@ def perf_stats(sample=5000, realm=None):
         }
     }
 def usage_snapshot(realm=None):
-    r = realm or CURRENT_REALM
+    r = realm_filter(realm or CURRENT_REALM)
     rep = POOL.representative(realm=r) if POOL else current_account()
     snap = _empty_stats()
     snap["started"] = _usage.get("started", time.time())
@@ -641,6 +655,7 @@ def usage_snapshot(realm=None):
     }
     return snap
 def recent_usage(limit=100, realm=None):
+    realm = realm_filter(realm)   # "auto" means every realm
     try:
         total, rows = usage_index().recent(limit=limit, realm=realm)
     except Exception:
@@ -1108,7 +1123,10 @@ INTL_UI_ORDER = [
     "kimi-k2.6",
 ]
 def merge_catalog(primary, realm=None):
-    r = realm or CURRENT_REALM
+    # A catalogue is per-realm; auto has none of its own, so it reads
+    # the international list (the broader one).
+    r = realm if realm in ("intl", "cn") else (
+        "intl" if CURRENT_REALM == "auto" else CURRENT_REALM)
     merged = {}
     source_static = getattr(wb_catalog, "STATIC_CN_MODELS" if r == "cn" else "STATIC_INTL_MODELS", wb_catalog.STATIC_MODELS)
     for item in source_static:
@@ -1131,7 +1149,10 @@ def merge_catalog(primary, realm=None):
             out.append((mid, merged[mid]))
     return out
 def fetch_models(realm=None):
-    r = realm or CURRENT_REALM
+    # A catalogue is per-realm; auto has none of its own, so it reads
+    # the international list (the broader one).
+    r = realm if realm in ("intl", "cn") else (
+        "intl" if CURRENT_REALM == "auto" else CURRENT_REALM)
     with _lock:
         c = _models_cache.get(r) or {"at": 0.0, "data": None}
         if c["data"] and time.time() - c["at"] < 300:
@@ -1249,7 +1270,10 @@ def model_entry(mid, meta):
     return item
 def read_product_config_models(realm=None):
     """Read the desktop app's cached catalog: [(id, meta), ...]."""
-    r = realm or CURRENT_REALM
+    # A catalogue is per-realm; auto has none of its own, so it reads
+    # the international list (the broader one).
+    r = realm if realm in ("intl", "cn") else (
+        "intl" if CURRENT_REALM == "auto" else CURRENT_REALM)
     home = os.path.expanduser("~")
     cache_dir = ".workbuddy-ai" if r == "intl" else ".workbuddy"
     p = os.path.join(home, cache_dir, "cache", "acc-product-config-v3.json")
@@ -2862,7 +2886,9 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/usage", "/v1/usage"):
             if not self._authorized():
                 return
-            req_realm = query.get('realm', [None])[0] or self.headers.get('X-Realm') or CURRENT_REALM
+            req_realm = realm_filter(
+                query.get('realm', [None])[0]
+                or self.headers.get('X-Realm') or CURRENT_REALM)
             return self._json(200, usage_snapshot(realm=req_realm))
         if path == "/usage/recent":
             if not self._authorized():
@@ -2871,7 +2897,9 @@ class Handler(BaseHTTPRequestHandler):
                 limit = max(1, min(1000, int((query.get("limit") or ["100"])[0])))
             except ValueError:
                 limit = 100
-            req_realm = query.get('realm', [None])[0] or self.headers.get('X-Realm') or CURRENT_REALM
+            req_realm = realm_filter(
+                query.get('realm', [None])[0]
+                or self.headers.get('X-Realm') or CURRENT_REALM)
             return self._json(200, recent_usage(limit, realm=req_realm))
         if path == "/accounts/credits":
             if not self._authorized():
@@ -2884,7 +2912,11 @@ class Handler(BaseHTTPRequestHandler):
             if not self._authorized():
                 return
             return self._json(200, {
-                "accounts": account_views(realm=query.get('realm', [None])[0] or CURRENT_REALM),
+                # "auto" means every realm here. Passing the literal "auto"
+                # as a filter matched no account, so the dashboard showed an
+                # empty pool while count_usable reported one.
+                "accounts": account_views(realm=realm_filter(
+                    query.get('realm', [None])[0] or CURRENT_REALM)),
                 "storage": ACCOUNTS_DIR,
                 "usable": POOL.count_usable() if POOL else 0,
             })
@@ -2945,7 +2977,9 @@ class Handler(BaseHTTPRequestHandler):
                 sample = max(10, min(20000, int((query.get("sample") or ["5000"])[0])))
             except ValueError:
                 sample = 5000
-            req_realm = query.get('realm', [None])[0] or self.headers.get('X-Realm') or CURRENT_REALM
+            req_realm = realm_filter(
+                query.get('realm', [None])[0]
+                or self.headers.get('X-Realm') or CURRENT_REALM)
             return self._json(200, perf_stats(sample, realm=req_realm))
         if path == "/tasks":
             if not self._authorized():
@@ -3316,7 +3350,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"results": results, "accounts": account_views()})
         if path == "/accounts/login/start":
             platform = payload.get("platform") or "CLI"
-            target_realm = payload.get("realm") or CURRENT_REALM
+            # A login must name a concrete realm. Falling back to CURRENT_REALM
+            # was wrong once "auto" became a mode: get_realm_config("auto")
+            # silently returns the international config, so adding a domestic
+            # account while auto was active quietly created an international
+            # one instead. Default to international only when nothing is set.
+            target_realm = payload.get("realm")
+            if target_realm not in ("intl", "cn"):
+                target_realm = ("intl" if CURRENT_REALM == "auto"
+                                else CURRENT_REALM)
             try:
                 started = POOL.start_login(realm=target_realm, platform=platform)
             except Exception as exc:

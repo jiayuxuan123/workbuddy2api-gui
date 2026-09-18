@@ -356,6 +356,78 @@ def pick_directory(prompt):
     return ask("%s（直接输入路径，留空取消）: " % prompt)
 
 
+
+# ---------------------------------------------------------------------------
+# Serving-instance guard
+# ---------------------------------------------------------------------------
+#: Ports that indicate a live gateway rather than just an open window. An
+#: update that stops one of these interrupts whatever is talking to it - which
+#: may be the very session the operator is using to run this update.
+WATCHED_PORTS = (8787, 8788, 8789, 8790)
+
+
+def listening_ports(pids=None):
+    """Which of :data:`WATCHED_PORTS` are being served right now.
+
+    Returns a list of (port, pid) so the caller can say exactly what is live
+    rather than "something is running".
+    """
+    if os.name != "nt":
+        return []
+    script = (
+        "Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | "
+        "Where-Object { %s } | "
+        "Select-Object LocalPort,OwningProcess | "
+        "ForEach-Object { \"$($_.LocalPort) $($_.OwningProcess)\" }"
+        % " -or ".join("$_.LocalPort -eq %d" % p for p in WATCHED_PORTS)
+    )
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", script],
+                             capture_output=True, timeout=30)
+    except Exception:
+        return []
+    found = []
+    text = (out.stdout or b"").decode("utf-8", "replace")
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        try:
+            port, pid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        if pids and pid not in pids:
+            continue
+        found.append((port, pid))
+    return found
+
+
+def ask_about_live_gateway(live, assume_yes=False):
+    """Decide whether to continue when a gateway is actively serving.
+
+    Returns True when it is safe to stop the processes. A live listener is
+    treated as a stop sign rather than a prompt, because the person clicking
+    through an update may not realise the gateway is what their own tools -
+    including an agent session - are talking to.
+    """
+    print()
+    print("  " + "!" * 58)
+    print("  检测到正在提供服务的网关：")
+    for port, pid in live:
+        print("      端口 %d  (pid %d)" % (port, pid))
+    print()
+    print("  继续更新会先停止它，正在使用该网关的连接会立即中断。")
+    print("  如果你正通过这个网关工作，请先自行关闭程序再更新。")
+    print("  " + "!" * 58)
+    print()
+    if assume_yes:
+        return True
+    try:
+        reply = input("  确定要停止并继续？(yes/N): ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return False
+    return reply in ("yes", "y")
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="%s 更新程序：替换程序文件，保留账号与设置" % APP_NAME)
@@ -364,7 +436,9 @@ def main(argv=None):
     parser.add_argument("--no-start", action="store_true",
                         help="更新后不自动启动程序")
     parser.add_argument("--yes", action="store_true",
-                        help="不询问，直接执行")
+                        help="不询问，直接执行（不影响正在服务的网关检查）")
+    parser.add_argument("--force-stop", action="store_true",
+                        help="即使网关正在提供服务也直接停止（会中断正在使用它的连接）")
     args = parser.parse_args(argv)
 
     print("=" * 62)
@@ -446,7 +520,15 @@ def main(argv=None):
 
     # ---- stop, update, start ----
     print()
-    print("[1/4] 停止正在运行的程序…")
+    print("[1/4] 检查并停止正在运行的程序…")
+    # Refuse to silently pull the rug out from under a live gateway: it may be
+    # serving the very session driving this update.
+    pids = running_pids()
+    live = listening_ports(pids)
+    if live:
+        if not ask_about_live_gateway(live, assume_yes=args.force_stop):
+            print("      已取消。")
+            return 1
     ok, message = stop_app()
     print("      %s" % message)
     if not ok:

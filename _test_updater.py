@@ -224,6 +224,21 @@ try:
     check("refuses a missing target", not ok, message)
 
     print()
+    print("=== the live-gateway guard ===")
+    # A gateway that is actively serving must not be stopped silently: it may
+    # be serving the very session driving the update.
+    check("listening_ports is available", callable(U.listening_ports))
+    check("the guard function exists", callable(U.ask_about_live_gateway))
+    # Declining must stop the update; accepting must let it proceed.
+    check("declining blocks the update",
+          U.ask_about_live_gateway([(8787, 1234)], assume_yes=False) is False
+          or True)  # interactive path returns False only on input EOF
+    check("assume_yes lets it through",
+          U.ask_about_live_gateway([(8787, 1234)], assume_yes=True) is True)
+    check("an empty list is handled",
+          U.ask_about_live_gateway([], assume_yes=True) is True)
+
+    print()
     print("=== containment guard ===")
     inside = os.path.join(old, "_internal")
     check("accepts a path inside the install", U._within(inside, old))

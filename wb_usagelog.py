@@ -191,7 +191,7 @@ class UsageLog(object):
 
     def totals(self, realm=None):
         with self._lock:
-            if realm:
+            if not self._is_all(realm):
                 return dict(self._totals.get(realm) or _new_totals())
             out = _new_totals()
             for totals in self._totals.values():
@@ -203,7 +203,7 @@ class UsageLog(object):
 
     def by_model(self, realm=None):
         with self._lock:
-            if realm:
+            if not self._is_all(realm):
                 src = self._by_model.get(realm) or {}
                 return {k: _copy_model_bucket(v) for k, v in src.items()}
             out = {}
@@ -250,9 +250,19 @@ class UsageLog(object):
             rows = rows[-sample:]
         return rows
 
+    @staticmethod
+    def _is_all(realm):
+        """True when the filter means "every realm".
+
+        ``auto`` is a routing mode, not a realm, so it selects everything.
+        Without this a viewer that passes CURRENT_REALM ("auto") matched no row
+        at all and every figure read zero.
+        """
+        return not realm or realm == "auto"
+
     def _select(self, realm):
         """Rows for a realm, or all rows when no realm filter is given."""
-        if not realm:
+        if self._is_all(realm):
             return list(self._rows)
         return [row for row, row_realm in zip(self._rows, self._row_realms)
                 if row_realm == realm]

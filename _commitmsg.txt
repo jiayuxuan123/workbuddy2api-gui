@@ -1,0 +1,46 @@
+fix: realm filters that matched nothing; redraw the UI in a plain light theme
+
+Realm filters (the reported symptom: the web dashboard showed an empty account
+pool and all-zero usage while /health correctly reported two accounts).
+
+"auto" was added as a routing mode, but several viewers still passed
+CURRENT_REALM straight into an equality filter. "auto" is not a realm, so those
+filters matched zero rows.
+
+  - wb_usagelog's totals/by_model/recent/tail treat "auto" (and None/"") as
+    "every realm" instead of comparing it to a stored realm name.
+  - /accounts and the ?realm= readers normalise through realm_filter(), so the
+    account list is the whole pool again.
+  - get_realm_config now raises on an unknown realm rather than quietly
+    returning the international config. That fallback is how a login started
+    while auto was active would have created an international account when a
+    domestic one was intended.
+  - /accounts/login/start resolves a concrete realm before calling the pool.
+  - Catalogue selection keeps working in every mode: a catalogue is per-realm,
+    so auto reads the international list rather than a realm that does not
+    exist.
+
+UI redrawn. The previous look was the giveaway of a generated interface: a
+hairline border around every element, read-only values rendered as full-width
+disabled inputs, four different accent colours across five number cards, and a
+dark violet background.
+
+  - Light palette by default: near-white page, white surfaces, separation from
+    whitespace and type scale rather than from boxes. A dark palette is still
+    available through the theme module.
+  - One accent colour, used only for the primary action. Numbers are normal
+    text; colour is reserved for state (running, failed), so a screen shows at
+    most a couple of touches of colour.
+  - Read-only values are a small dim caption above the value instead of a
+    bordered box that looks editable but is not.
+  - Flat tabs with an underline for the active one, replacing a box per tab.
+  - Labels no longer paint the window colour, which had shown as grey bands
+    behind every caption sitting on a white surface.
+
+Updater: refuses to stop a gateway that is actively listening without an
+explicit confirmation or --force-stop. An update that stops the instance the
+operator is working through cuts their own session, and the person clicking
+through does not necessarily connect the two.
+
+Tests: adds the realm-filter suite (27 checks) and extends the updater suite
+with the live-gateway guard. 15 suites, all green.

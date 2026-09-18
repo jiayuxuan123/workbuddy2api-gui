@@ -121,7 +121,20 @@ USER_AGENT = REALM_CONFIGS['intl']['chat_ua']
 DEFAULT_UA_VERSION = '5.5.2'
 
 def get_realm_config(realm):
-    return REALM_CONFIGS.get(realm) or REALM_CONFIGS["intl"]
+    """Return the upstream configuration for a realm.
+
+    Only "intl" and "cn" have configurations. Anything else raises rather than
+    silently falling back to the international one: a quiet fallback is how
+    "auto" - a routing mode, not a realm - ended up being treated as
+    international, so a login started while auto was active created an
+    international account when a domestic one was intended. Failing loudly
+    surfaces that class of mistake at the call site.
+    """
+    try:
+        return REALM_CONFIGS[realm]
+    except KeyError:
+        raise ValueError(
+            "unknown realm %r; expected 'intl' or 'cn'" % (realm,))
 
 def _jwt_claims(token):
     try:
