@@ -28,3 +28,6 @@ build-onefile/
 !workbuddy2api.spec
 build-updater/
 dist-updater/
+
+# Runtime preferences written next to the EXE at first launch.
+gateway.json
