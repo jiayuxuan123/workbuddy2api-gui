@@ -66,25 +66,55 @@ for model in ("minimax-m3", "minimax-anything-new", "deepseek-v4-pro"):
           P.detect_model_realm(model) == "cn",
           P.detect_model_realm(model))
 
-print()
-print("=== shared models fall back to the active realm ===")
-original = P.CURRENT_REALM
-try:
-    for realm in ("intl", "cn"):
-        P.CURRENT_REALM = realm
-        for model in ("deepseek-v4.1-flash", "glm-5.3", "hy3", "kimi-k3"):
-            actual = P.detect_model_realm(model)
-            check("%s with active=%s -> %s" % (model, realm, realm),
-                  actual == realm, actual)
-finally:
-    P.CURRENT_REALM = original
+SHARED = ("deepseek-v4.1-flash", "glm-5.3", "hy3", "kimi-k3")
 
 print()
-print("=== an empty model falls back to the active realm ===")
-P.CURRENT_REALM = "cn"
-check("empty string -> cn", P.detect_model_realm("") == "cn")
-check("None -> cn", P.detect_model_realm(None) == "cn")
-P.CURRENT_REALM = original
+print("=== auto mode: shared models may take either exit ===")
+original_realm = P.CURRENT_REALM
+original_auto = P.realm_auto()
+try:
+    P.set_realm_auto(True)
+    for realm in ("intl", "cn", "auto"):
+        P.CURRENT_REALM = realm
+        for model in SHARED:
+            actual = P.detect_model_realm(model)
+            check("%s with auto on -> either (empty)" % model, actual == "",
+                  "%r while CURRENT_REALM=%s" % (actual, realm))
+    check("an empty model is also unconstrained",
+          P.detect_model_realm("") == "")
+    check("None is also unconstrained", P.detect_model_realm(None) == "")
+
+    print()
+    print("=== pinned mode: shared models follow the chosen realm ===")
+    P.set_realm_auto(False)
+    for realm in ("intl", "cn"):
+        P.CURRENT_REALM = realm
+        for model in SHARED:
+            actual = P.detect_model_realm(model)
+            check("%s with auto off follows %s" % (model, realm),
+                  actual == realm, actual)
+    P.CURRENT_REALM = "cn"
+    check("empty model follows the pinned realm",
+          P.detect_model_realm("") == "cn", P.detect_model_realm(""))
+    check("None follows the pinned realm",
+          P.detect_model_realm(None) == "cn", P.detect_model_realm(None))
+
+    print()
+    print("=== resolve_realm: explicit choice wins ===")
+    P.set_realm_auto(True)
+    check("explicit intl beats auto", P.resolve_realm("glm-5.3", "intl") == "intl")
+    check("explicit cn beats auto", P.resolve_realm("glm-5.3", "cn") == "cn")
+    check("an exclusive model still wins over auto",
+          P.resolve_realm("gpt-5.6-sol") == "intl",
+          P.resolve_realm("gpt-5.6-sol"))
+    check("a domestic model still wins over auto",
+          P.resolve_realm("minimax-m3") == "cn",
+          P.resolve_realm("minimax-m3"))
+    check("a shared model is unconstrained in auto",
+          P.resolve_realm("glm-5.3") == "", P.resolve_realm("glm-5.3"))
+finally:
+    P.set_realm_auto(original_auto)
+    P.CURRENT_REALM = original_realm
 
 print()
 print("=== the two sets do not overlap ===")

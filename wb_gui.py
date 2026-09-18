@@ -48,7 +48,7 @@ import wb_runtime
 import wb_settings
 import wb_ui_theme as theme
 
-REALM_LABELS = {"intl": "国际版", "cn": "国内版"}
+REALM_LABELS = {"intl": "国际版", "cn": "国内版", "auto": "自动"}
 
 #: Poll cadences (ms). Status only reads a cached snapshot, so it can be
 #: frequent; accounts and usage touch the disk and run slower.
@@ -608,11 +608,35 @@ class MainWindow(QMainWindow):
         self.access = {}
         for key, label in (("url", "接口地址 (Base URL)"),
                            ("key", "API Key"),
-                           ("realm", "当前区域"),
                            ("scheduler", "定时任务")):
             field = ReadonlyField(label)
             access.body.addWidget(field)
             self.access[key] = field
+
+        # ---- realm switch ----
+        # Three choices rather than two. Auto is the default and the one most
+        # people want: models that exist in both realms are served by whichever
+        # account is free, so an idle account on the other side still gets used.
+        # Pinning to one realm is for when a specific exit is required.
+        realm_row = QHBoxLayout()
+        realm_label_widget = QLabel("区域路由")
+        realm_label_widget.setFixedWidth(150)
+        realm_row.addWidget(realm_label_widget)
+        self.realm_choice = QComboBox()
+        self.realm_choice.addItem("自动（推荐，两个区域都能用）", "auto")
+        self.realm_choice.addItem("只用国际版 (www.workbuddy.ai)", "intl")
+        self.realm_choice.addItem("只用国内版 (copilot.tencent.com)", "cn")
+        self.realm_choice.setMinimumWidth(280)
+        self.realm_choice.currentIndexChanged.connect(self.do_switch_realm)
+        realm_row.addWidget(self.realm_choice, 1)
+        self.realm_apply_button = QPushButton("应用")
+        self.realm_apply_button.setFixedWidth(70)
+        self.realm_apply_button.clicked.connect(self.do_switch_realm)
+        realm_row.addWidget(self.realm_apply_button)
+        access.body.addLayout(realm_row)
+
+        self.realm_hint = hint_label("")
+        access.body.addWidget(self.realm_hint)
         key_row = QHBoxLayout()
         self.regen_key_button = QPushButton("重新生成 Key")
         self.regen_key_button.setProperty("variant", "secondary")
@@ -1243,6 +1267,58 @@ class MainWindow(QMainWindow):
         ok, message = self.gateway.restart()
         self.set_status(message)
         self.refresh_status()
+
+    def _realm_hint(self, realm):
+        """Explain what the current realm choice means for routing."""
+        if realm == "auto":
+            try:
+                pool = wb_proxy.POOL
+                intl_ready = pool.count_usable("intl") if pool else 0
+                cn_ready = pool.count_usable("cn") if pool else 0
+            except Exception:
+                intl_ready = cn_ready = 0
+            base = ("自动模式：两个版本都有的模型（DeepSeek、GLM、Kimi 等）"
+                    "会按账号空闲情况自动分配到任一侧，"
+                    "只属于某个版本的模型固定走对应出口。")
+            if intl_ready and cn_ready:
+                return base + "  国际版可用 %d 个，国内版可用 %d 个。" % (
+                    intl_ready, cn_ready)
+            if intl_ready or cn_ready:
+                return base + "  当前只有%s账号可用。" % (
+                    "国际版" if intl_ready else "国内版")
+            return base
+        try:
+            pool = wb_proxy.POOL
+            ready = pool.count_usable(realm) if pool else 0
+        except Exception:
+            ready = 0
+        base = ("已固定走「%s」：两个版本都有的模型（DeepSeek、GLM、Kimi 等）"
+                "全部走这一侧；只属于某个版本的模型自动走对应出口。"
+                % realm_label(realm))
+        if ready == 0:
+            return base + "  注意：该区域当前没有可用账号。"
+        return base + "  该区域可用账号 %d 个。" % ready
+
+    @Slot()
+    def do_switch_realm(self, _index=None):
+        """Change which exit serves models available in both realms."""
+        chosen = self.realm_choice.currentData()
+        if chosen not in ("auto", "intl", "cn"):
+            return
+        if chosen == wb_proxy.CURRENT_REALM:
+            return
+        try:
+            wb_proxy.save_persisted_realm(chosen)
+        except Exception as exc:
+            self.fail("切换失败", str(exc))
+            return
+        label = ("自动" if chosen == "auto"
+                 else realm_label(chosen) + "版")
+        self.set_status("已切换：%s" % label)
+        # Everything the UI shows is realm-filtered, so refresh it all.
+        self.refresh_status()
+        self.refresh_accounts()
+        self.refresh_usage()
 
     @Slot()
     def open_panel(self):
@@ -2083,8 +2159,17 @@ class MainWindow(QMainWindow):
         else:
             shown = "(本机模式无需 Key)"
         self.access["key"].set_text(shown)
-        self.access["realm"].set_text(realm_label(wb_proxy.CURRENT_REALM))
         self.access["scheduler"].set_text(status.get("scheduler_next") or "未启用")
+
+        # Keep the realm selector showing the truth, without firing the
+        # change handler while we do it.
+        active = wb_proxy.CURRENT_REALM
+        index = self.realm_choice.findData(active)
+        if index >= 0 and index != self.realm_choice.currentIndex():
+            self.realm_choice.blockSignals(True)
+            self.realm_choice.setCurrentIndex(index)
+            self.realm_choice.blockSignals(False)
+        self.realm_hint.setText(self._realm_hint(active))
 
     @Slot()
     def refresh_accounts(self):
@@ -2229,11 +2314,16 @@ class MainWindow(QMainWindow):
                     item.setForeground(QColor(theme.SUCCESS))
                 rtable.setItem(row_index, column, item)
 
+    #: Most log lines rendered in one tick. Each line becomes an HTML block,
+    #: so a large batch is what made switching to the Logs tab stutter; the
+    #: poller catches up over the next ticks instead of freezing the window.
+    LOG_RENDER_BATCH = 200
+
     @Slot()
     def refresh_logs(self, force=False):
         level = self.log_level.currentText()
         search = self.log_search.text().strip()
-        entries = wb_proxy.get_logs(limit=400,
+        entries = wb_proxy.get_logs(limit=self.LOG_RENDER_BATCH,
                                     level="" if level == "全部" else level,
                                     search=search,
                                     since_id=0 if force else self._log_tail)
@@ -2245,14 +2335,18 @@ class MainWindow(QMainWindow):
             self.log_view.clear()
 
         if rows:
-            # Cap what is rendered per tick so a burst cannot stall the UI.
-            for row in rows[-400:]:
+            batch = rows[-self.LOG_RENDER_BATCH:]
+            # Build one HTML string and insert it once. Appending per line
+            # re-lays out the document on every call, which is what turned a
+            # burst of log lines into a visible stall.
+            chunks = []
+            for row in batch:
                 level_name = row.get("level", "INFO")
                 color = theme.LEVEL_COLORS.get(level_name, theme.FG_DIM)
                 message = (row.get("msg", "")
                            .replace("&", "&amp;").replace("<", "&lt;")
                            .replace(">", "&gt;"))
-                self.log_view.appendHtml(
+                chunks.append(
                     '<span style="color:%s">%s</span>'
                     '<span style="color:%s">  %s</span>'
                     '<span style="color:%s">  [%s]</span>'
@@ -2261,9 +2355,16 @@ class MainWindow(QMainWindow):
                        color, level_name,
                        theme.FG_MUTED, row.get("tag", ""),
                        theme.FG_DIM, message))
+            self.log_view.appendHtml("<br>".join(chunks))
             if self.log_autoscroll.isChecked():
                 bar = self.log_view.verticalScrollBar()
                 bar.setValue(bar.maximum())
+
+        # If a backlog remains, come back for it promptly rather than waiting
+        # for the next scheduled tick - but still yield to the event loop so
+        # the window stays responsive while it drains.
+        if len(rows) >= self.LOG_RENDER_BATCH:
+            QTimer.singleShot(50, lambda: self.refresh_logs(False))
 
     # ------------------------------------------------------------------- close
     def closeEvent(self, event):

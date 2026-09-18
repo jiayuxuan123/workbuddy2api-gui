@@ -32,7 +32,11 @@ import wb_catalog
 import wb_runtime
 import wb_settings
 import wb_usagelog
-CURRENT_REALM = os.environ.get("WB_PROXY_DEFAULT_REALM", "intl")
+# Default to auto: a model available in both realms should be served by
+# whichever account is free, rather than pinning every shared model to one
+# exit while the other side sits idle. WB_PROXY_DEFAULT_REALM still allows
+# an explicit "intl" or "cn" at startup.
+CURRENT_REALM = os.environ.get("WB_PROXY_DEFAULT_REALM", "auto")
 # Models that exist on one side only. Everything else (deepseek-v4.1-flash,
 # hy3, glm-5.3 ...) is served by both exits, so it must not be treated as a
 # conflict.
@@ -62,9 +66,14 @@ def detect_model_realm(model_id):
 
     Reads the shared realm sets so routing cannot disagree with the
     cross-realm check in :func:`exclusive_realm`.
+
+    Returns "" for a model both realms serve when auto mode is active, meaning
+    "no preference" - the pool then picks any usable account. Returning the
+    literal realm here would pin every shared model to one exit even when the
+    other side is idle.
     """
     if not model_id:
-        return CURRENT_REALM
+        return "" if realm_auto() else CURRENT_REALM
     m = str(model_id).lower()
     if m in INTL_EXCLUSIVE or any(m.startswith(p)
                                  for p in INTL_EXCLUSIVE_PREFIXES):
@@ -72,8 +81,47 @@ def detect_model_realm(model_id):
     if m in CN_EXCLUSIVE or any(m.startswith(p)
                                 for p in CN_EXCLUSIVE_PREFIXES):
         return "cn"
-    # Served by both exits: keep it on whichever realm is currently selected.
+    # Served by both exits.
+    if realm_auto():
+        return ""            # let the pool decide
     return CURRENT_REALM
+
+
+#: When true, models available in both realms are served by whichever account
+#: is free rather than being pinned to the selected realm.
+AUTO_REALM = (
+    CURRENT_REALM == "auto"
+    and os.environ.get("WB_PROXY_AUTO_REALM", "1").lower()
+    not in ("0", "false", "no", "off"))
+
+
+def realm_auto():
+    """True when shared models may be served by either realm."""
+    return AUTO_REALM
+
+
+def set_realm_auto(enabled):
+    """Turn auto routing on or off. Returns the new value."""
+    global AUTO_REALM
+    AUTO_REALM = bool(enabled)
+    return AUTO_REALM
+
+
+def resolve_realm(model_id, explicit=None):
+    """The realm to use for one request.
+
+    Order of precedence:
+      1. an explicit choice (a key bound to a realm, or ?realm=)
+      2. the realm that exclusively owns the model
+      3. auto mode: "" meaning any realm
+      4. the selected realm
+    """
+    if explicit in ("intl", "cn"):
+        return explicit
+    owner = exclusive_realm(model_id)
+    if owner:
+        return owner
+    return detect_model_realm(model_id)
 
 
 def exclusive_realm(model_id):
@@ -269,16 +317,32 @@ def _extract_usage(usage):
         "credit": usage.get("credit") or 0,
     }
 def row_matches_realm(row, realm):
-    if not realm: return True
+    """Whether a usage row belongs to the realm being viewed.
+
+    An empty ``realm`` means "show everything" (the auto view). A row is
+    matched on its recorded realm first, then on the owning account, and only
+    then on the model - a shared model says nothing about which exit served
+    the request.
+    """
+    if not realm:
+        return True
     r = row.get("realm")
-    if r: return r == realm
+    if r:
+        return r == realm
     acct_uid = row.get("account")
     if acct_uid and POOL:
         acc = POOL.get(acct_uid)
-        if acc: return acc.realm == realm
+        if acc:
+            return acc.realm == realm
     model = row.get("model")
-    if model: return detect_model_realm(model) == realm
-    return realm == "intl"
+    if model:
+        owner = exclusive_realm(model)
+        # A shared model could have been served by either exit, so it must not
+        # be attributed to one of them on the strength of its name alone.
+        if owner:
+            return owner == realm
+        return True
+    return True
 def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_ms=None, fp=None,
                 account=None):
     """Accumulate stats, append a JSONL row, and persist the summary."""
@@ -593,22 +657,27 @@ def load_persisted_realm():
             with open(REALM_STATE_FILE, "r", encoding="utf-8") as fh:
                 d = json.load(fh)
                 r = d.get("realm")
-                if r in ("intl", "cn"):
+                if r in ("auto", "intl", "cn"):
                     CURRENT_REALM = r
+                    set_realm_auto(r == "auto")
                     return CURRENT_REALM
         except Exception as e:
             log("could not load active realm: %s" % e)
     return CURRENT_REALM
 def save_persisted_realm(realm):
-    """Persist the active realm, confining the write to the accounts directory.
+    """Persist the realm choice so it survives a restart.
 
-    ``realm`` is already restricted to the two known values above; the path
-    check and the stdlib-chosen temp name guard the file itself, so the write
-    cannot land outside the data directory.
+    Accepts ``auto`` as well as ``intl`` and ``cn``. Auto is the default: a
+    model that exists in both realms is served by whichever account is free,
+    rather than being pinned to one exit.
     """
     global CURRENT_REALM
-    if realm in ("intl", "cn"):
+    if realm in ("auto", "intl", "cn"):
         CURRENT_REALM = realm
+        # The auto flag must follow the choice, otherwise a saved "cn" would
+        # still route shared models to either realm - the selector would look
+        # pinned while routing was not.
+        set_realm_auto(realm == "auto")
         try:
             root = os.path.realpath(ACCOUNTS_DIR)
             os.makedirs(root, exist_ok=True)
@@ -1599,7 +1668,16 @@ CHAT_RETRY_BACKOFF = 1.5
 
 
 def open_upstream(payload, session_key=None, target_realm=None):
-    realm = target_realm or detect_model_realm(payload.get("model")) or CURRENT_REALM
+    """POST to the upstream, rotating accounts when one is rejected.
+
+    ``realm`` may be "" here, which means auto: the model is served by both
+    exits, so any usable account will do. ``target_realm`` and the explicit
+    realm on the request both take precedence when set.
+    """
+    if target_realm in ("intl", "cn"):
+        realm = target_realm
+    else:
+        realm = resolve_realm(payload.get("model"), explicit=target_realm)
     upstream_body = build_upstream_body(payload)
     body = json.dumps(upstream_body, ensure_ascii=False).encode("utf-8")
     # PATCHED-BY-OPS: 客户端未提供会话标识时，用对话稳定前缀兜底。
@@ -1610,14 +1688,19 @@ def open_upstream(payload, session_key=None, target_realm=None):
         if session_key and AFFINITY_DEBUG:
             log("affinity: derived %s for %d msgs"
                 % (session_key, len(upstream_body.get("messages") or [])))
-    total = max(1, POOL.count_ready(realm)) if POOL else 1
+    # realm == "" means auto: consider accounts from either realm. The retry
+    # budget therefore spans the whole pool rather than one side of it.
+    pool_realm = realm if realm in ("intl", "cn") else None
+    total = max(1, POOL.count_ready(pool_realm)) if POOL else 1
     tried = set()
     last_error = None
     for _ in range(total):
-        account = POOL.pick_for_session(realm=realm, session_key=session_key, exclude=tried) if POOL else None
+        account = POOL.pick_for_session(realm=pool_realm, session_key=session_key, exclude=tried) if POOL else None
         if account is None:
             break
-        if account.realm != realm:
+        # Only a realm-specific request insists on a matching account; in auto
+        # mode whichever account was picked is fine.
+        if pool_realm and account.realm != pool_realm:
             if session_key and POOL: POOL.affinity.unbind(session_key)
             continue
         tried.add(account.uid)
@@ -1681,7 +1764,12 @@ def open_upstream(payload, session_key=None, target_realm=None):
                 break
     if last_error is not None:
         raise last_error
-    raise RuntimeError(f"no usable account for realm '{realm}': all are disabled, cooling down, or expired")
+    if realm:
+        raise RuntimeError(
+            f"no usable account for realm '{realm}': all are disabled, "
+            f"cooling down, or expired")
+    raise RuntimeError(
+        "no usable account: all are disabled, cooling down, or expired")
 def extract_session_key(headers, payload):
     key = (
         headers.get("X-Conversation-Id") or
@@ -2734,10 +2822,18 @@ class Handler(BaseHTTPRequestHandler):
             rep = current_account()
             info = {
                 "ok": True,
-                "realm": "intl",
+                # Report the realm actually in use. This used to be the
+                # literal "intl", which made the field useless and produced
+                # replies that contradicted themselves - realm "intl" next to
+                # a copilot.tencent.com account.
+                "realm": CURRENT_REALM,
                 "accounts": len(POOL.accounts) if POOL else 0,
                 "accounts_ready": POOL.count_usable() if POOL else 0,
-                "api_key_required": bool(API_KEY),
+                # Whether a key is actually demanded, not merely configured.
+                # A key can exist for client convenience while loopback calls
+                # are still served without one.
+                "api_key_required": auth_required(),
+                "api_key_configured": bool(API_KEY) or bool(configured_keys()),
             }
             if self._key_ok():
                 info.update({
@@ -2751,7 +2847,8 @@ class Handler(BaseHTTPRequestHandler):
         # Accept the conventional /v1 prefix and the bare path, because clients
         # differ in whether they append "/v1" themselves.
         if path == "/realm":
-            return self._json(200, {"current": CURRENT_REALM, "options": ["intl", "cn"]})
+            return self._json(200, {"current": CURRENT_REALM,
+                                  "options": ["auto", "intl", "cn"]})
         if path in ("/v1/models", "/models"):
             if not self._authorized():
                 return
@@ -3204,7 +3301,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True})
         if path == "/realm":
             new_realm = payload.get("realm")
-            if new_realm in ("intl", "cn"):
+            if new_realm in ("auto", "intl", "cn"):
                 save_persisted_realm(new_realm)
             return self._json(200, {"ok": True, "current": CURRENT_REALM, "persisted": True})
         if path == "/accounts/checkin":
