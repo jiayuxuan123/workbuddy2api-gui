@@ -2897,6 +2897,9 @@ class Handler(BaseHTTPRequestHandler):
         # MCP library management reads and writes the user's home files.
         if path.startswith("/mcp"):
             return True
+        # Session management scans the user's home CLI directories.
+        if path.startswith("/sessions"):
+            return True
         # Exact match on purpose: /health itself must stay public because the
         # launcher uses it to detect a running copy.
         if path == "/health/breakers":
@@ -3067,6 +3070,28 @@ class Handler(BaseHTTPRequestHandler):
                 query.get('realm', [None])[0]
                 or self.headers.get('X-Realm') or CURRENT_REALM)
             return self._json(200, usage_cost(realm=req_realm))
+        if path == "/sessions":
+            # /sessions 是 panel 路由，鉴权已在 do_GET 顶部统一做掉；
+            # 这里只需扫描并返回元数据列表。
+            try:
+                import wb_sessions
+                return self._json(200, {"sessions": wb_sessions.scan_sessions()})
+            except Exception as exc:
+                return self._error(500, "session scan failed: %s" % exc)
+        if path == "/sessions/messages":
+            provider = (query.get("provider") or [""])[0]
+            source = (query.get("path") or [""])[0]
+            if not provider or not source:
+                return self._error(400, "provider and path are required",
+                                   "invalid_request_error")
+            try:
+                import wb_sessions
+                return self._json(200, {"messages": wb_sessions.load_messages(
+                    provider, source)})
+            except wb_sessions.SessionError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
+            except Exception as exc:
+                return self._error(500, "failed to load messages: %s" % exc)
         if path == "/usage/perf":
             if not self._authorized():
                 return
@@ -3832,6 +3857,31 @@ class Handler(BaseHTTPRequestHandler):
                 "models_covered": len(table.prices),
                 "fetched_at": table.fetched_at,
             })
+        if path == "/sessions/delete":
+            # 删除用户 home 下某个 CLI 的会话文件，属于破坏性写操作，
+            # 必须走面板口令；模块内部还有根目录包含 + ID 核对两层防护。
+            if not self._panel_ok():
+                return self._error(401, "panel password required",
+                                   "invalid_request_error")
+            payload = self._payload_or_error()
+            if payload is None:
+                return
+            provider = payload.get("provider")
+            session_id = payload.get("session_id")
+            source = payload.get("source_path")
+            if (not isinstance(provider, str) or not provider
+                    or not isinstance(session_id, str) or not session_id
+                    or not isinstance(source, str) or not source):
+                return self._error(400, "provider, session_id and source_path "
+                                        "are required", "invalid_request_error")
+            try:
+                import wb_sessions
+                wb_sessions.delete_session(provider, session_id, source)
+            except wb_sessions.SessionError as exc:
+                return self._error(400, str(exc), "invalid_request_error")
+            except OSError as exc:
+                return self._error(500, "failed to delete session: %s" % exc)
+            return self._json(200, {"ok": True})
         if self._is_panel_route(path) and not self._panel_ok():
             return self._error(401, "panel password required", "invalid_request_error")
         is_account_route = (
