@@ -31,3 +31,7 @@ dist-updater/
 
 # Runtime preferences written next to the EXE at first launch.
 gateway.json
+
+# Runtime data: the provider library holds the user's captured configs.
+providers.json
+mcp.json
