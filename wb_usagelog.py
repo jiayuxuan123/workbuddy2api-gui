@@ -23,6 +23,14 @@ import os
 import threading
 import time
 
+import wb_pricing
+
+
+def wb_pricing_cost(model, prompt_tokens, completion_tokens, cached_tokens):
+    """Thin indirection so tests can patch wb_pricing.cost_of in one place."""
+    return wb_pricing.cost_of(model, prompt_tokens, completion_tokens,
+                              cached_tokens)
+
 #: Fields carried through from each JSONL row for aggregation.
 _TOKEN_FIELDS = ("prompt_tokens", "completion_tokens", "reasoning_tokens",
                  "cached_tokens", "total_tokens", "credit")
@@ -30,6 +38,34 @@ _TOKEN_FIELDS = ("prompt_tokens", "completion_tokens", "reasoning_tokens",
 #: How many parsed rows to retain for the "recent" and percentile views.
 #: Bounded so a multi-gigabyte log cannot exhaust memory.
 DEFAULT_WINDOW = 20000
+
+#: Per-day aggregate bucket. Kept tiny (one per calendar day, not per row)
+#: so years of history stay cheap; cost is folded in at absorb time using
+#: whatever price table was current, and can be recomputed from tokens on
+#: demand when prices change.
+def _new_day_bucket():
+    return {
+        "date": "", "requests": 0, "errors": 0,
+        "prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0,
+        "cached_tokens": 0, "total_tokens": 0, "credit": 0.0,
+        "cost": 0.0, "cost_estimated": 0,
+    }
+
+
+def day_of_row(row):
+    """Local calendar date (YYYY-MM-DD) for a log row.
+
+    Prefers the ``iso`` stamp the proxy writes; falls back to the epoch
+    ``at`` field for rows from other writers.
+    """
+    iso = row.get("iso")
+    if isinstance(iso, str) and len(iso) >= 10:
+        return iso[:10]
+    at = row.get("at")
+    try:
+        return time.strftime("%Y-%m-%d", time.localtime(float(at)))
+    except (TypeError, ValueError):
+        return ""
 
 
 def _copy_model_bucket(bucket):
@@ -71,6 +107,7 @@ class UsageLog(object):
         self._totals = {}         # realm -> totals
         self._by_model = {}       # realm -> {model: {requests, accounts, tokens}}
         self._by_account = {}     # account -> aggregate bucket
+        self._by_day = {}         # YYYY-MM-DD -> day bucket (all realms)
         self._parsed = 0
 
     # ---------------------------------------------------------------- reading
@@ -124,11 +161,39 @@ class UsageLog(object):
             model_key = row.get("model") or "?"
             acct["models"][model_key] = acct["models"].get(model_key, 0) + 1
 
+        # Daily bucket (all realms; the per-realm cost view filters rows via
+        # _row_realms at read time instead of duplicating buckets per realm).
+        day = day_of_row(row)
+        if day:
+            self._fold_day(self._by_day, day, row, is_error)
+
         self._rows.append(row)
         self._row_realms.append(realm)
         if len(self._rows) > self.window:
             del self._rows[:len(self._rows) - self.window]
             del self._row_realms[:len(self._row_realms) - self.window]
+
+    #: Day-bucket fold used by both the index and the cost view's per-realm
+    #: recomputation. Kept as a module function so the cost endpoint can
+    #: rebuild buckets for arbitrary row selections with identical semantics.
+    @staticmethod
+    def _fold_day(bucket_map, day, row, is_error):
+        bucket = bucket_map.setdefault(day, _new_day_bucket())
+        bucket["date"] = day
+        if is_error:
+            bucket["errors"] += 1
+            return
+        bucket["requests"] += 1
+        for field in ("prompt_tokens", "completion_tokens", "reasoning_tokens",
+                      "cached_tokens", "total_tokens", "credit"):
+            if field in row:
+                bucket[field] += (row[field] or 0)
+        cost, entry = wb_pricing_cost(
+            row.get("model"), row.get("prompt_tokens") or 0,
+            row.get("completion_tokens") or 0, row.get("cached_tokens") or 0)
+        bucket["cost"] += cost
+        if entry is None:
+            bucket["cost_estimated"] += 1
 
     def _reset(self):
         self._offset = 0
@@ -137,6 +202,7 @@ class UsageLog(object):
         self._totals = {}
         self._by_model = {}
         self._by_account = {}
+        self._by_day = {}
         self._parsed = 0
 
     def refresh(self, realm_of=None):
@@ -271,6 +337,32 @@ class UsageLog(object):
         with self._lock:
             return {"parsed": self._parsed, "window": len(self._rows),
                     "offset": self._offset}
+
+    def by_day(self, realm=None):
+        """Per-calendar-day aggregates, oldest first.
+
+        The incremental ``_by_day`` buckets are all-realm; a realm filter
+        recomputes from the bounded tail window (same semantics as the
+        ``recent`` views — full history across realms remains the common
+        case, since the tail window holds the last DEFAULT_WINDOW rows).
+
+        When prices change, call :meth:`invalidate` and refresh(): the
+        buckets are rebuilt from the log at the new prices.
+        """
+        with self._lock:
+            if self._is_all(realm):
+                buckets = [dict(v) for v in self._by_day.values()]
+            else:
+                map_by_day = {}
+                for row, row_realm in zip(self._rows, self._row_realms):
+                    if row_realm != realm:
+                        continue
+                    day = day_of_row(row)
+                    if day:
+                        self._fold_day(map_by_day, day, row, bool(row.get("error")))
+                buckets = list(map_by_day.values())
+        buckets.sort(key=lambda b: b["date"])
+        return buckets
 
 
 _default = None

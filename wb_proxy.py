@@ -30,6 +30,7 @@ import uuid
 import wb_accounts
 import wb_catalog
 import wb_health
+import wb_pricing
 import wb_runtime
 import wb_settings
 import wb_usagelog
@@ -752,6 +753,51 @@ def usage_by_account():
     except Exception as exc:
         log("usage_by_account failed: %s" % exc)
         return []
+
+
+def usage_cost(realm=None):
+    """Per-day cost view for the dashboard's spend chart.
+
+    Reads the incremental index's day buckets (all-realm) or recomputes
+    from the tail window when a realm filter is set; carries the pricing
+    metadata so the UI can flag estimated (fallback-priced) entries.
+    """
+    r = realm_filter(realm or CURRENT_REALM)
+    try:
+        table = wb_pricing.get_table(
+            cache_path=os.path.join(USAGE_DIR, "prices-cache.json"))
+    except Exception as exc:
+        log("pricing table unavailable: %s" % exc)
+        table = None
+    try:
+        days = usage_index().by_day(realm=r)
+    except Exception as exc:
+        log("usage_cost day aggregation failed: %s" % exc)
+        days = []
+    total_cost = sum(d.get("cost", 0.0) for d in days)
+    total_est = sum(d.get("cost_estimated", 0) for d in days)
+    total_req = sum(d.get("requests", 0) for d in days)
+    meta = wb_pricing.price_meta(table=table) if table else {
+        "source": "unavailable", "models_covered": 0, "fetched_at": 0.0,
+        "fallback_input_per_mtok": wb_pricing.FALLBACK_PRICE["input"] * 1e6,
+        "fallback_output_per_mtok": wb_pricing.FALLBACK_PRICE["output"] * 1e6,
+    }
+    meta["currency"] = "USD"
+    meta["unit"] = "per-token prices; shown as USD"
+    return {
+        "realm": r,
+        "days": days,
+        "totals": {
+            "requests": total_req,
+            "cost": round(total_cost, 6),
+            "cost_estimated_requests": total_est,
+            "prompt_tokens": sum(d.get("prompt_tokens", 0) for d in days),
+            "completion_tokens": sum(d.get("completion_tokens", 0) for d in days),
+            "cached_tokens": sum(d.get("cached_tokens", 0) for d in days),
+            "total_tokens": sum(d.get("total_tokens", 0) for d in days),
+        },
+        "pricing": meta,
+    }
 #: Analytics needs true all-time totals, which the bounded tail window cannot
 #: provide, so its result is memoised on the log's (size, mtime) instead. The
 #: dashboard re-requests this endpoint every 5 s while the tab is open; without
@@ -3014,6 +3060,13 @@ class Handler(BaseHTTPRequestHandler):
             if not self._authorized():
                 return
             return self._json(200, {"accounts": usage_by_account()})
+        if path == "/usage/cost":
+            if not self._authorized():
+                return
+            req_realm = realm_filter(
+                query.get('realm', [None])[0]
+                or self.headers.get('X-Realm') or CURRENT_REALM)
+            return self._json(200, usage_cost(realm=req_realm))
         if path == "/usage/perf":
             if not self._authorized():
                 return
@@ -3760,6 +3813,25 @@ class Handler(BaseHTTPRequestHandler):
             if payload is None:
                 return
             return self._handle_mcp(path, payload)
+        if path == "/usage/cost/refresh":
+            # Forced re-pull of the remote price list (LiteLLM/OpenRouter).
+            # Read-only for local data but performs an outbound fetch, so
+            # keep it behind the panel password like other admin actions.
+            if not self._panel_ok():
+                return self._error(401, "panel password required",
+                                   "invalid_request_error")
+            try:
+                table = wb_pricing.get_table(
+                    cache_path=os.path.join(USAGE_DIR, "prices-cache.json"),
+                    force_refresh=True)
+            except Exception as exc:
+                return self._error(502, f"price refresh failed: {exc}")
+            return self._json(200, {
+                "ok": True,
+                "source": table.source,
+                "models_covered": len(table.prices),
+                "fetched_at": table.fetched_at,
+            })
         if self._is_panel_route(path) and not self._panel_ok():
             return self._error(401, "panel password required", "invalid_request_error")
         is_account_route = (
