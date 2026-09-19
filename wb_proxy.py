@@ -2848,6 +2848,13 @@ class Handler(BaseHTTPRequestHandler):
             return True
         if path.startswith("/logs"):
             return True
+        # MCP library management reads and writes the user's home files.
+        if path.startswith("/mcp"):
+            return True
+        # Exact match on purpose: /health itself must stay public because the
+        # launcher uses it to detect a running copy.
+        if path == "/health/breakers":
+            return True
         return False
     def do_OPTIONS(self):
         self.send_response(204)
@@ -3073,6 +3080,26 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, wb_providers.preview(client_id))
             except Exception as exc:
                 return self._error(400, str(exc))
+        if path == "/mcp":
+            # Read-only view of the MCP library plus what each client's own
+            # file currently holds. It reads files in the user's home
+            # directory, so the panel password gates it, same as /providers.
+            if not self._panel_ok():
+                return self._error(401, "panel password required",
+                                   "invalid_request_error")
+            try:
+                import wb_mcp
+                return self._json(200, wb_mcp.status())
+            except Exception as exc:
+                return self._error(500, "could not read MCP status: %s" % exc)
+        if path == "/health/breakers":
+            # Circuit-breaker snapshot for the dashboard. Read-only and gated:
+            # it names accounts and their recent upstream failures.
+            if not self._panel_ok():
+                return self._error(401, "panel password required",
+                                   "invalid_request_error")
+            snap = wb_health.ACCOUNTS.snapshot()
+            return self._json(200, {"breakers": snap})
         if path == "/logs":
             if not self._authorized():
                 return
@@ -3556,7 +3583,10 @@ class Handler(BaseHTTPRequestHandler):
                 if key is None:
                     key = API_KEY or ""
                 result = wb_providers.apply(client_id, port=port, key=key)
-                log("provider: pointed %s at %s" % (client_id, result["endpoint"]))
+                # apply() returns the switch report, not the endpoint; compute
+                # the endpoint the same way the provider library does.
+                log("provider: pointed %s at %s"
+                    % (client_id, wb_providers.gateway_endpoint(port=port)))
             else:
                 result = wb_providers.revert(client_id)
                 log("provider: restored %s from backup" % client_id)
@@ -3565,6 +3595,63 @@ class Handler(BaseHTTPRequestHandler):
 
         result["providers"] = wb_providers.status()
         return self._json(200, result)
+
+    def _handle_mcp(self, path, payload):
+        """MCP library management, modelled on cc-switch's per-app projection."""
+        try:
+            import wb_mcp
+        except Exception as exc:
+            return self._error(500, "MCP module unavailable: %s" % exc)
+
+        def _fail(exc):
+            if isinstance(exc, wb_mcp.McpError):
+                return self._error(400, str(exc), "invalid_request_error")
+            return self._error(500, "MCP operation failed: %s" % exc)
+
+        if path == "/mcp/upsert":
+            server = payload.get("server")
+            if not isinstance(server, dict):
+                return self._error(400, "server object required", "invalid_request_error")
+            try:
+                cleaned = wb_mcp.upsert_server(server)
+            except Exception as exc:
+                return _fail(exc)
+            log("mcp: upserted server %s" % cleaned.get("id"))
+            return self._json(200, {"server": cleaned})
+
+        if path == "/mcp/delete":
+            sid = str(payload.get("id") or "").strip()
+            if not sid:
+                return self._error(400, "id required", "invalid_request_error")
+            try:
+                wb_mcp.delete_server(sid)
+            except Exception as exc:
+                return _fail(exc)
+            log("mcp: deleted server %s" % sid)
+            return self._json(200, {"deleted": sid})
+
+        if path == "/mcp/set":
+            sid = str(payload.get("id") or "").strip()
+            app_id = str(payload.get("app") or "").strip()
+            if not sid or not app_id:
+                return self._error(400, "id and app required", "invalid_request_error")
+            try:
+                cleaned = wb_mcp.set_app_enabled(sid, app_id, bool(payload.get("enabled")))
+            except Exception as exc:
+                return _fail(exc)
+            log("mcp: %s %s for %s"
+                % ("enabled" if payload.get("enabled") else "disabled", sid, app_id))
+            return self._json(200, {"server": cleaned})
+
+        if path == "/mcp/sync":
+            try:
+                report = wb_mcp.sync_all()
+            except Exception as exc:
+                return _fail(exc)
+            log("mcp: synced library to installed clients")
+            return self._json(200, {"report": report})
+
+        return self._error(404, "unknown mcp endpoint", "invalid_request_error")
 
     def _handle_responses(self, payload):
         """Serve /v1/responses by translating to chat completions upstream."""
@@ -3657,9 +3744,22 @@ class Handler(BaseHTTPRequestHandler):
             if not self._panel_ok():
                 return self._error(401, "panel password required",
                                    "invalid_request_error")
+            payload = self._payload_or_error()
+            if payload is None:
+                return
             return self._handle_providers(path, payload)
         if path in ("/panel/login", "/panel/logout", "/panel/password"):
             return self._handle_panel(path)
+        if path.startswith("/mcp/"):
+            # MCP writes touch the user's home files, exactly like the
+            # provider switch does, so the same panel gate applies.
+            if not self._panel_ok():
+                return self._error(401, "panel password required",
+                                   "invalid_request_error")
+            payload = self._payload_or_error()
+            if payload is None:
+                return
+            return self._handle_mcp(path, payload)
         if self._is_panel_route(path) and not self._panel_ok():
             return self._error(401, "panel password required", "invalid_request_error")
         is_account_route = (
