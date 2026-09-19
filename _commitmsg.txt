@@ -1,25 +1,11 @@
-feat: check for updates inside the program
+test: exercise the update path through the product's own extractor
 
-Replaces the routine of downloading a whole update package and copying it over
-by hand. Settings now has an Update section: it shows the running version, asks
-the release page whether a newer one exists, and can download and install it in
-place.
+The fixture installation is now built by writing a zip and letting
+wb_update.extract_zip() create the files, instead of writing paths directly in
+the test. Two reasons: every location stays inside the scratch directory made
+in this file, and the setup travels the same code path a real update does.
 
-  - the version comes from the redirect target of /releases/latest rather than
-    the API. The API is rate limited per address and this machine shares one,
-    so an unauthenticated lookup failed almost immediately; the redirect needs
-    no credentials and is not rate limited
-  - only GitHub hosts are accepted, re-checked before every request, so a bad
-    repository value or a redirect cannot send the download elsewhere
-  - installing keeps the standalone updater's guarantees: back up
-    accounts/usage/gateway.json, replace only the program files, roll back on
-    failure, then relaunch
-  - an optional proxy (WB_UPDATE_PROXY) is honoured, because GitHub is often
-    unreachable directly from this network
-
-Adds APP_VERSION and RELEASE_REPO to wb_proxy so the version has one home, and
-resolves the download target before writing to it.
-
-Tests: a 34-check suite covering version comparison, host allow-listing, a full
-install round trip against a locally built archive (data preserved, backup
-written), rejection of malformed archives, and the panel's three states.
+Also corrects an assertion: the backup covers the user's data only
+(accounts, usage, gateway.json). The program files are replaced wholesale from
+the download, so keeping a second copy of them would only double the disk cost.
+The test now asserts that, rather than expecting program files in the backup.
