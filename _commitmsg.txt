@@ -1,32 +1,25 @@
-fix: dashboard showed a fixed realm; add the missing task actions
+feat: check for updates inside the program
 
-The reported symptom was that realm routing looked unimplemented - the web
-panel kept showing one exit (usually 国内版) no matter what the gateway was
-doing, so "auto" appeared to have no effect.
+Replaces the routine of downloading a whole update package and copying it over
+by hand. Settings now has an Update section: it shows the running version, asks
+the release page whether a newer one exists, and can download and install it in
+place.
 
-Routing was in fact working: usage rows show 362 requests served by the
-international account and 149 by the domestic one. The fault was in the page.
-It treated the realm as a boolean - "is it intl?" - so "auto" fell into the
-else branch and was rendered as 国内版, and the switch button could only toggle
-between two states.
+  - the version comes from the redirect target of /releases/latest rather than
+    the API. The API is rate limited per address and this machine shares one,
+    so an unauthenticated lookup failed almost immediately; the redirect needs
+    no credentials and is not rate limited
+  - only GitHub hosts are accepted, re-checked before every request, so a bad
+    repository value or a redirect cannot send the download elsewhere
+  - installing keeps the standalone updater's guarantees: back up
+    accounts/usage/gateway.json, replace only the program files, roll back on
+    failure, then relaunch
+  - an optional proxy (WB_UPDATE_PROXY) is honoured, because GitHub is often
+    unreachable directly from this network
 
-  - a shared label table covers all three modes, and a helper resolves the
-    name so every call site agrees
-  - the view has a third tab for the combined picture, and the gateway switch
-    cycles auto -> intl -> cn -> auto
-  - the page starts on the gateway's actual mode rather than assuming one
-  - adding an account always names a concrete realm. Previously the login
-    dialog fell back to "not cn", so with the view on auto it preselected
-    国际版 - someone meaning to add a domestic account would add an
-    international one, which is the realm mix-up the split exists to prevent
+Adds APP_VERSION and RELEASE_REPO to wb_proxy so the version has one home, and
+resolves the download target before writing to it.
 
-GUI tasks panel gains the three actions the web panel had: a manual check-in,
-run growth tasks, and cat travel, each against a chosen domestic account or
-all of them. The scheduled run happens once or twice a day, so a failure had
-no retry path short of opening a browser. The account picker lists domestic
-accounts only, because those actions are a China-realm feature.
-
-Tests: adds a dashboard suite (24 checks: three-mode handling, no remaining
-boolean realm tests, login always concrete) and a task-panel suite (22 checks:
-buttons, picker filtering, each action reaching the right upstream call,
-single-account targeting, missing pool handled). 19 suites, all green.
+Tests: a 34-check suite covering version comparison, host allow-listing, a full
+install round trip against a locally built archive (data preserved, backup
+written), rejection of malformed archives, and the panel's three states.

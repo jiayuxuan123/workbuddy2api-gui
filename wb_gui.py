@@ -36,7 +36,8 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
     QMenu,
-    QMessageBox, QPlainTextEdit, QPushButton, QRadioButton, QScrollArea,
+    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QRadioButton,
+    QScrollArea,
     QSizePolicy, QSpinBox, QStatusBar, QSystemTrayIcon, QTableWidget,
     QTableWidgetItem, QTabWidget, QTextEdit, QVBoxLayout, QWidget,
 )
@@ -47,6 +48,7 @@ import wb_proxy
 import wb_runtime
 import wb_settings
 import wb_ui_theme as theme
+import wb_update
 
 REALM_LABELS = {"intl": "国际版", "cn": "国内版", "auto": "自动"}
 
@@ -1109,6 +1111,37 @@ class MainWindow(QMainWindow):
         path_row.addWidget(open_dir)
         advanced.body.addLayout(path_row)
         layout.addWidget(advanced)
+
+        # ---- updates ----
+        # Checking here replaces the old routine of downloading a whole update
+        # package and copying it over by hand.
+        updates = Panel("更新")
+        self.version_label = QLabel("当前版本 %s" % wb_update.current_version())
+        updates.body.addWidget(self.version_label)
+        self.update_status = hint_label(
+            "点「检查更新」查看是否有新版本。升级会保留账号、用量与设置，"
+            "并在替换前自动备份。")
+        updates.body.addWidget(self.update_status)
+
+        update_row = QHBoxLayout()
+        self.check_update_button = QPushButton("检查更新")
+        self.check_update_button.clicked.connect(self.do_check_update)
+        self.install_update_button = QPushButton("下载并更新")
+        self.install_update_button.setEnabled(False)
+        self.install_update_button.clicked.connect(self.do_install_update)
+        self.update_page_button = QPushButton("打开发布页")
+        self.update_page_button.setProperty("variant", "secondary")
+        self.update_page_button.clicked.connect(self.do_open_release_page)
+        update_row.addWidget(self.check_update_button)
+        update_row.addWidget(self.install_update_button)
+        update_row.addStretch(1)
+        update_row.addWidget(self.update_page_button)
+        updates.body.addLayout(update_row)
+
+        self.update_progress = QProgressBar()
+        self.update_progress.setVisible(False)
+        updates.body.addWidget(self.update_progress)
+        layout.addWidget(updates)
 
         actions = QHBoxLayout()
         save = QPushButton("保存设置")
@@ -2310,6 +2343,127 @@ class MainWindow(QMainWindow):
                 "设置已保存。\n\n监听地址与端口的改动需要重启服务后生效。")
         else:
             self.set_status("设置已保存")
+
+    # ------------------------------------------------------------- updates
+    @Slot()
+    def do_check_update(self):
+        """Ask the release page whether a newer version exists."""
+        self.check_update_button.setEnabled(False)
+        self.update_status.setText("正在检查…")
+
+        def done(result):
+            self.check_update_button.setEnabled(True)
+            self.update_page_button.setEnabled(True)
+            self._update_result = result
+            if not result.get("ok"):
+                self.update_status.setText("检查失败：%s" % result.get("error"))
+                self.install_update_button.setEnabled(False)
+                return
+            self.update_page_button.setEnabled(True)
+            if result.get("has_update"):
+                self.update_status.setText(
+                    "发现新版本 %s（当前 %s）。点「下载并更新」即可升级。"
+                    % (result.get("latest"), result.get("current")))
+                self.install_update_button.setEnabled(True)
+            else:
+                self.update_status.setText(
+                    "已是最新版本（%s）。" % result.get("current"))
+                self.install_update_button.setEnabled(False)
+
+        self.run_async(wb_update.check_for_update, done,
+                       lambda msg: (self.check_update_button.setEnabled(True),
+                                    self.update_status.setText("检查失败：%s" % msg)))
+
+    @Slot()
+    def do_install_update(self):
+        """Download the newest release and swap the program files in place."""
+        result = getattr(self, "_update_result", None) or {}
+        assets = result.get("assets") or []
+        if not assets:
+            self.info("没有可用的下载", "请先点「检查更新」。")
+            return
+        if not self.ask(
+                "下载并更新",
+                "将下载 %s 并替换程序文件。\n\n"
+                "账号、用量与设置都会保留，替换前会自动备份。\n"
+                "更新完成后程序会自动重启。\n\n确定继续？"
+                % result.get("latest", "")):
+            return
+
+        self.install_update_button.setEnabled(False)
+        self.check_update_button.setEnabled(False)
+        self.update_progress.setVisible(True)
+        self.update_progress.setRange(0, 0)          # indeterminate until sized
+        self.update_status.setText("正在下载…")
+
+        def progress(done_bytes, total):
+            # Called from the worker thread; only touch state the UI reads
+            # through a queued signal is safe, so post it to the UI thread.
+            self.root_update_progress(done_bytes, total)
+
+        def work():
+            return wb_update.download_and_install(assets[0], progress=progress)
+
+        def done(outcome):
+            ok, message, backup = outcome
+            self.update_progress.setVisible(False)
+            self.check_update_button.setEnabled(True)
+            if not ok:
+                self.install_update_button.setEnabled(True)
+                self.update_status.setText("更新失败：%s" % message)
+                self.fail("更新失败", message)
+                return
+            self.update_status.setText("更新完成，正在重启…")
+            self.info("更新完成",
+                      "程序已更新。\n\n备份：%s\n\n"
+                      "窗口即将关闭并重新启动。" % (backup or "(无)"))
+            # Replace this process with the new build so the user does not
+            # have to close and reopen it by hand.
+            QTimer.singleShot(800, self._restart_after_update)
+
+        self.run_async(work, done,
+                       lambda msg: (self.update_progress.setVisible(False),
+                                    self.check_update_button.setEnabled(True),
+                                    self.install_update_button.setEnabled(True),
+                                    self.update_status.setText("更新失败：%s" % msg),
+                                    self.fail("更新失败", msg)))
+
+    @Slot()
+    def do_open_release_page(self):
+        """Open the releases page in a browser."""
+        repo = wb_proxy.RELEASE_REPO
+        url = ("https://github.com/%s/releases" % repo) if repo else \
+              "https://github.com"
+        if not QDesktopServices.openUrl(QUrl(url)):
+            self.warn("无法打开浏览器", "请手动访问：%s" % url)
+
+    def root_update_progress(self, done_bytes, total):
+        """Update the progress bar on the UI thread."""
+        if total:
+            self.update_progress.setRange(0, 100)
+            pct = int(done_bytes * 100 / total)
+            self.update_progress.setValue(pct)
+            self.update_status.setText(
+                "正在下载… %d%%（%.1f MB）" % (pct, total / 1048576.0))
+        else:
+            self.update_status.setText(
+                "正在下载… %.1f MB" % (done_bytes / 1048576.0))
+
+    def _restart_after_update(self):
+        """Stop serving and relaunch, so the replacement binary takes over."""
+        try:
+            if self.gateway.is_running():
+                self.gateway.stop()
+        except Exception:
+            pass
+        ok, message = wb_update.restart_self()
+        if not ok:
+            self.fail("重启失败", "更新已完成，请手动打开程序。\n\n%s" % message)
+            return
+        self._quitting = True
+        if self._tray:
+            self._tray.hide()
+        QApplication.quit()
 
     @Slot()
     def do_reset_settings(self):

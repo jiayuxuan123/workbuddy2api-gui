@@ -170,6 +170,14 @@ def install_console_close_handler():
         return handler
     except Exception:
         return None
+#: Release version. Shown in the window and compared against the published
+#: releases when checking for updates, so it must be bumped on every release.
+APP_VERSION = "1.7.0"
+
+#: Where releases are published. The update check reads this repository's
+#: release feed; keeping it in one place means a fork only edits one line.
+RELEASE_REPO = "jiayuxuan123/workbuddy2api-gui"
+
 UPSTREAM = "https://www.workbuddy.ai"
 #: Hosts this process may send authenticated requests to. Requests built below
 #: are re-validated against this list before being sent: they carry the
