@@ -1,40 +1,23 @@
-feat: point other AI clients at this gateway (provider switching)
+feat: panel page for pointing other AI tools at this gateway
 
-Adds the capability that makes cc-switch useful: instead of hand-editing each
-tool's JSON or TOML, write this gateway into the client's own config file and
-switch back with one click.
+Adds the UI for the provider-switching backend: a "客户端接入" page listing
+Claude Code, Codex CLI and Gemini CLI, each showing whether it is installed and
+whether it currently points at this gateway.
 
-Supported clients and their formats:
+Actions per client:
 
-  Claude Code   ~/.claude/settings.json   env.ANTHROPIC_BASE_URL / AUTH_TOKEN
-  Codex CLI     ~/.codex/config.toml      model_provider + provider table,
-                                          key in auth.json
-  Gemini CLI    ~/.gemini/.env            GOOGLE_GEMINI_BASE_URL / API_KEY
+  - 接入本网关        write this gateway into that tool's own config file
+  - 还原原始配置      put the file back from the backup taken on first write
+  - 预览改动          show the file and the before/after values first
 
-Behaviour that matters:
+Backend endpoints, all gated on the panel password rather than an API key,
+because they write configuration outside this program's own data directory:
 
-  - only the gateway's own keys are written; the user's model choice, theme and
-    other settings are preserved
-  - the original file is backed up the first time it is touched, and can be
-    restored from the panel
-  - a file that is not valid JSON/TOML is refused rather than overwritten, so a
-    hand-edited config is never silently destroyed
-  - re-applying is idempotent: one provider table, one model_provider line
-  - the port comes from the live gateway when it is running, otherwise the saved
-    preference, resolved the same way when writing and when detecting
+  GET  /providers              each client's state
+  GET  /providers/preview      what applying would change
+  POST /providers/apply        point a client at the gateway
+  POST /providers/revert       restore from the backup
 
-Three real bugs were found and fixed while building this:
-
-  - a top-level TOML key was appended at the end of the file, which puts it
-    inside the last table. Codex reads model_provider from the root, so the
-    setting was invisible - now inserted before the first table header.
-  - detection compared against the default port while apply() wrote the
-    supplied one, so a client correctly pointing at us reported "not us".
-    Both directions now resolve the port identically.
-  - wb_gateway now exposes ACTIVE_PORT, so modules can read the port the
-    gateway is actually on rather than re-deriving it from a preferences file
-    that may be stale or belong to another directory.
-
-Tests: a 42-check suite covering all three formats, preservation of user
-settings, idempotent re-apply, backup and restore, refusal of corrupt files,
-and the path guard that keeps writes inside the client's own folder.
+Verified over real HTTP: the routes reject an unauthenticated caller with 401,
+list all three clients once signed in, resolve the preview correctly, and a full
+apply/restore round trip preserves the user's own settings.

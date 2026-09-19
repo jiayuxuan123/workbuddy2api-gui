@@ -195,6 +195,9 @@ a:hover{text-decoration:underline}
       <button class="main-nav-btn" id="btnNavLogs" onclick="switchMainTab('logs')">
         运行日志
       </button>
+      <button class="main-nav-btn" id="btnNavClients" onclick="switchMainTab('clients')">
+        客户端接入
+      </button>
       <button class="main-nav-btn" id="btnNavSettings" onclick="switchMainTab('settings')">
         设置
       </button>
@@ -577,6 +580,25 @@ a:hover{text-decoration:underline}
       <button onclick="restartLogin()">重新生成链接</button>
     </div>
   </div>
+</div>
+
+<div id="pageClients" style="display:none">
+  <div style="margin-bottom:16px">
+    <h2 style="margin:0;font-size:16px;color:var(--fg)">客户端接入</h2>
+    <div style="font-size:12px;color:var(--dim);margin-top:4px">
+      把本网关写进其它 AI 工具自己的配置里，省去手工编辑 JSON / TOML。
+      只改动网关自己的字段，原有设置保留；改动前会自动备份，可一键还原。
+    </div>
+  </div>
+
+  <div id="clientsIntro" class="card" style="margin-bottom:14px;padding:14px 16px">
+    <div style="font-size:13px;color:var(--dim)">
+      下面的客户端如果显示「未安装」，说明本机还没装它 —— 仍然可以写入配置，
+      装好后即可直接使用。
+    </div>
+  </div>
+
+  <div id="clientsList"></div>
 </div>
 
 <div class="modal-mask" id="desktopScanModal">
@@ -2188,20 +2210,119 @@ async function saveApiKeys(btn){
   }
 }
 
+/* ------------------------- clients (provider switching) ------------------ */
+/* Each entry is one AI tool. "接入" writes this gateway into that tool's own
+   config file; "还原" puts the file back from the backup taken on first write. */
+async function loadClients(showToast){
+  const box = document.getElementById('clientsList');
+  if(!box) return;
+  let data;
+  try {
+    data = await getJSON('/providers');
+  }catch(e){
+    box.innerHTML = '<div class="empty">读取失败：' + esc(e.message) + '</div>';
+    return;
+  }
+  const providers = data.providers || {};
+  const ids = Object.keys(providers);
+  if(!ids.length){
+    box.innerHTML = '<div class="empty">没有可用的客户端</div>';
+    return;
+  }
+  const rows = ids.map(function(id){
+    const p = providers[id] || {};
+    const state = p.is_gateway
+      ? '<span class="badge ok">已接入本网关</span>'
+      : (p.base_url ? '<span class="badge warn">指向别处</span>'
+                    : '<span class="badge off">未配置</span>');
+    const installed = p.installed
+      ? '<span class="badge s">已安装</span>'
+      : '<span class="badge off">未安装</span>';
+    const url = p.base_url
+      ? '<span class="mono" style="font-size:11px;color:var(--dim)">' + esc(p.base_url) + '</span>'
+      : '<span style="color:var(--dim)">—</span>';
+    const hasKey = p.has_key
+      ? '<span class="badge ok">有 Key</span>'
+      : '<span class="badge off">无 Key</span>';
+    return '<div class="card" style="margin-bottom:12px;padding:16px 18px">'
+      + '<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px">'
+      +   '<b style="font-size:14px">' + esc(p.name || id) + '</b>'
+      +   state + installed
+      + '</div>'
+      + '<div style="font-size:12px;color:var(--dim);margin-bottom:6px">'
+      +   '当前 Base URL：' + url + '　' + hasKey
+      + '</div>'
+      + '<div class="mono" style="font-size:11px;color:var(--dim);margin-bottom:10px">'
+      +   esc(p.file || '') + '</div>'
+      + '<div style="font-size:12px;color:var(--dim);margin-bottom:12px">'
+      +   esc(p.note || '') + '</div>'
+      + '<div style="display:flex;gap:8px;flex-wrap:wrap">'
+      +   '<button onclick="applyClient(&quot;' + id + '&quot;, this)">接入本网关</button>'
+      +   '<button class="sec" onclick="revertClient(&quot;' + id + '&quot;, this)">还原原始配置</button>'
+      +   '<button class="sec" onclick="previewClient(&quot;' + id + '&quot;)">预览改动</button>'
+      + '</div>'
+      + '</div>';
+  }).join('');
+  box.innerHTML = rows;
+}
+
+async function applyClient(id, btn){
+  if(btn){ btn.disabled = true; }
+  try{
+    const r = await postJSON('/providers/apply', {client: id});
+    toast('已把 ' + (r.name || id) + ' 指向本网关');
+    await loadClients();
+  }catch(e){
+    alert('接入失败：' + e.message);
+  }finally{
+    if(btn){ btn.disabled = false; }
+  }
+}
+
+async function revertClient(id, btn){
+  if(!confirm('把该客户端的配置还原为接入前的备份？')) return;
+  if(btn){ btn.disabled = true; }
+  try{
+    await postJSON('/providers/revert', {client: id});
+    toast('已还原原始配置');
+    await loadClients();
+  }catch(e){
+    alert('还原失败：' + e.message);
+  }finally{
+    if(btn){ btn.disabled = false; }
+  }
+}
+
+async function previewClient(id){
+  try{
+    const r = await getJSON('/providers/preview?client=' + encodeURIComponent(id));
+    alert('文件：' + (r.file || '?')
+      + '\n\nBase URL：' + (r.before_base_url || '(未设置)')
+      + '  →  ' + (r.after_base_url || '?')
+      + '\nKey：' + (r.before_has_key ? '有' : '无')
+      + '  →  ' + (r.after_has_key ? '有' : '无'));
+  }catch(e){
+    alert('预览失败：' + e.message);
+  }
+}
+
 function switchMainTab(tab){
   currentMainTab = tab;
   const btnGateway = document.getElementById('btnNavGateway');
   const btnAnalytics = document.getElementById('btnNavAnalytics');
   const btnLogs = document.getElementById('btnNavLogs');
+  const btnClients = document.getElementById('btnNavClients');
   const btnSettings = document.getElementById('btnNavSettings');
   const pageGateway = document.getElementById('pageGateway');
   const pageAnalytics = document.getElementById('pageAnalytics');
   const pageLogs = document.getElementById('pageLogs');
+  const pageClients = document.getElementById('pageClients');
   const pageSettings = document.getElementById('pageSettings');
   const tabs = [
     ['gateway', btnGateway, pageGateway],
     ['analytics', btnAnalytics, pageAnalytics],
     ['logs', btnLogs, pageLogs],
+    ['clients', btnClients, pageClients],
     ['settings', btnSettings, pageSettings]
   ];
   tabs.forEach(([name, btn, page]) => {
@@ -2211,6 +2332,7 @@ function switchMainTab(tab){
     page.style.display = on ? 'block' : 'none';
   });
   if(tab === 'analytics') loadAnalytics();
+  if(tab === 'clients') loadClients();
   if(tab === 'settings') loadSettings();
   if(tab === 'logs'){
     startLogPolling();

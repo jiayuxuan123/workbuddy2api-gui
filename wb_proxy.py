@@ -3021,6 +3021,29 @@ class Handler(BaseHTTPRequestHandler):
             if not self._authorized():
                 return
             return self._json(200, runtime_settings_view())
+        if path == "/providers":
+            # Lists each supported client and whether it points at us. Read-only,
+            # but it reports the contents of files outside this program's data
+            # directory, so it is gated on the panel password like the rest of
+            # the management surface.
+            if not self._panel_ok():
+                return self._error(401, "panel password required",
+                                   "invalid_request_error")
+            try:
+                import wb_providers
+                return self._json(200, {"providers": wb_providers.status()})
+            except Exception as exc:
+                return self._error(500, "could not read provider status: %s" % exc)
+        if path == "/providers/preview":
+            if not self._panel_ok():
+                return self._error(401, "panel password required",
+                                   "invalid_request_error")
+            client_id = (query.get("client") or [""])[0]
+            try:
+                import wb_providers
+                return self._json(200, wb_providers.preview(client_id))
+            except Exception as exc:
+                return self._error(400, str(exc))
         if path == "/logs":
             if not self._authorized():
                 return
@@ -3484,6 +3507,36 @@ class Handler(BaseHTTPRequestHandler):
                 "accounts": account_views(),
             })
         return self._error(404, "unknown account endpoint", "invalid_request_error")
+    def _handle_providers(self, path, payload):
+        """Point a client at this gateway, or put its config back."""
+        try:
+            import wb_providers
+        except Exception as exc:
+            return self._error(500, "provider module unavailable: %s" % exc)
+
+        client_id = str(payload.get("client") or "").strip()
+        if not client_id:
+            return self._error(400, "client required", "invalid_request_error")
+
+        try:
+            if path == "/providers/apply":
+                # Default to the port this gateway is actually on, so the value
+                # written matches reality even when it was overridden at launch.
+                port = payload.get("port") or wb_gateway_port()
+                key = payload.get("api_key")
+                if key is None:
+                    key = API_KEY or ""
+                result = wb_providers.apply(client_id, port=port, key=key)
+                log("provider: pointed %s at %s" % (client_id, result["endpoint"]))
+            else:
+                result = wb_providers.revert(client_id)
+                log("provider: restored %s from backup" % client_id)
+        except Exception as exc:
+            return self._error(400, str(exc))
+
+        result["providers"] = wb_providers.status()
+        return self._json(200, result)
+
     def _handle_responses(self, payload):
         """Serve /v1/responses by translating to chat completions upstream."""
         session_key = extract_session_key(self.headers, payload)
@@ -3568,6 +3621,14 @@ class Handler(BaseHTTPRequestHandler):
             if not self._panel_ok():
                 return self._error(401, "panel password required", "invalid_request_error")
             return self._handle_settings_save()
+        if path in ("/providers/apply", "/providers/revert"):
+            # These write configuration files in the user's home directory, so
+            # the panel password is required: an API key issued to a client
+            # must not be able to rewrite other tools' settings.
+            if not self._panel_ok():
+                return self._error(401, "panel password required",
+                                   "invalid_request_error")
+            return self._handle_providers(path, payload)
         if path in ("/panel/login", "/panel/logout", "/panel/password"):
             return self._handle_panel(path)
         if self._is_panel_route(path) and not self._panel_ok():
@@ -3694,6 +3755,22 @@ class Handler(BaseHTTPRequestHandler):
                          gen_ms=(wall - first_ms) if first_ms is not None else None,
                          fp=fp, account=account.uid)
             return self._json(200, result)
+def wb_gateway_port():
+    """The port this gateway is listening on, or the saved preference.
+
+    Kept separate so the provider endpoints write the address that clients can
+    actually reach, rather than a default that may not be in use.
+    """
+    try:
+        import wb_gateway
+        live = getattr(wb_gateway, "ACTIVE_PORT", None)
+        if live:
+            return int(live)
+        return int(wb_gateway.load_prefs().get("port") or 8788)
+    except Exception:
+        return 8788
+
+
 def build_server(host, port):
     """Create the HTTP server without starting to serve.
 
