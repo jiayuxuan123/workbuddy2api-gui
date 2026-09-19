@@ -240,6 +240,13 @@ a:hover{text-decoration:underline}
             <span class="tab-desc">copilot.tencent.com</span>
           </div>
         </div>
+        <div id="tabAuto" class="realm-tab" onclick="switchViewRealm('auto')">
+          
+          <div class="tab-text">
+            <span class="tab-title">全部 (自动路由)</span>
+            <span class="tab-desc">两个出口合并显示</span>
+          </div>
+        </div>
       </div>
     </div>
     <div class="realm-banner-right" style="background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:12px 16px">
@@ -634,11 +641,22 @@ function closeLogin(){
 
 function openLoginModal(){
   openLogin();
-  const isCn = (window.VIEW_REALM === "cn");
+  // Pre-select a concrete realm: adding an account must name one. With the
+  // view on "auto" there is no realm to infer, and the previous
+  // "!isCn" default silently preselected 国际版 - so someone meaning to add a
+  // domestic account would add an international one instead.
+  const view = window.VIEW_REALM;
+  const preferCn = (view === "cn");
   const rCn = document.getElementById("radioCn");
   const rIntl = document.getElementById("radioIntl");
-  if(rCn) rCn.checked = isCn;
-  if(rIntl) rIntl.checked = !isCn;
+  if(rCn) rCn.checked = preferCn;
+  if(rIntl) rIntl.checked = !preferCn;
+  if(view === "auto"){
+    const statusBox = document.getElementById("loginStatus");
+    if(statusBox){
+      statusBox.textContent = "请先选择要添加的版本（国际版或国内版），再在浏览器里登录。";
+    }
+  }
   triggerLoginForSelectedRealm();
 }
 
@@ -652,7 +670,10 @@ function restartLogin(){
 
 async function triggerLoginForSelectedRealm(){
   const checkedRadio = document.querySelector('input[name="loginRealm"]:checked');
-  const realm = checkedRadio ? checkedRadio.value : (window.VIEW_REALM || "intl");
+  // A login needs a real realm; "auto" is a routing mode and cannot be logged
+  // into. Fall back to 国际版 only when nothing at all is selected.
+  let realm = checkedRadio ? checkedRadio.value : window.VIEW_REALM;
+  if(realm !== "intl" && realm !== "cn") realm = "intl";
   const isCn = (realm === "cn");
 
   if(loginTimer){ clearInterval(loginTimer); loginTimer = null; }
@@ -711,35 +732,62 @@ async function pollLogin(){
 }
 
 
-window.ACTIVE_GATEWAY_REALM = "intl";
-window.VIEW_REALM = "intl";
+// Placeholder until /realm answers; the gateway defaults to auto, so the page
+// starts there rather than assuming one exit.
+window.ACTIVE_GATEWAY_REALM = "auto";
+window.VIEW_REALM = "auto";
 window.REALM_FILTER = "all";
 window.MODELS_DATA = [];
 window.ACCOUNTS = [];
 
+// The gateway has three routing modes, not two. Treating the value as a
+// boolean ("is it intl?") meant "auto" fell into the else branch and the page
+// reported a fixed realm - usually 国内版 - no matter what the gateway was
+// actually doing. Everything below switches on the real value.
+const REALM_LABELS = { intl: "国际版", cn: "国内版", auto: "自动" };
+const REALM_ENDPOINTS = {
+  intl: "https://www.workbuddy.ai/v2",
+  cn: "https://copilot.tencent.com/v2",
+  auto: "两个出口按账号空闲自动分配",
+};
+
+function realmLabel(r){
+  return REALM_LABELS[r] || r || "?";
+}
+
 function updateUI(){
-  const isIntlView = (window.VIEW_REALM === "intl");
+  const view = window.VIEW_REALM;
+  const isIntlView = (view === "intl");
+  const isCnView = (view === "cn");
+  const isAutoView = (view === "auto");
+
   const tIntl = document.getElementById("tabIntl");
   const tCn = document.getElementById("tabCn");
+  const tAuto = document.getElementById("tabAuto");
   if(tIntl) tIntl.className = "realm-tab" + (isIntlView ? " active" : "");
-  if(tCn) tCn.className = "realm-tab" + (!isIntlView ? " active" : "");
+  if(tCn) tCn.className = "realm-tab" + (isCnView ? " active" : "");
+  if(tAuto) tAuto.className = "realm-tab" + (isAutoView ? " active" : "");
 
-  const isIntlGw = (window.ACTIVE_GATEWAY_REALM === "intl");
+  const gw = window.ACTIVE_GATEWAY_REALM;
   const gwName = document.getElementById("activeGatewayName");
   if(gwName) {
-    gwName.textContent = isIntlGw ? "国际版" : "国内版";
-    gwName.style.color = isIntlGw ? "var(--accent)" : "var(--warn)";
+    gwName.textContent = realmLabel(gw);
+    gwName.style.color = (gw === "cn") ? "var(--warn)" : "var(--accent)";
   }
   const ep = document.getElementById("activeEndpoint");
-  if(ep) ep.textContent = isIntlGw ? "https://www.workbuddy.ai/v2" : "https://copilot.tencent.com/v2";
+  if(ep) ep.textContent = REALM_ENDPOINTS[gw] || REALM_ENDPOINTS.auto;
 
+  // The toggle cycles auto -> intl -> cn -> auto so all three modes are
+  // reachable from the panel.
   const btnToggle = document.getElementById("btnToggleRealm");
   if(btnToggle) {
-    btnToggle.textContent = isIntlGw ? "切换网关上游为【国内版】" : "切换网关上游为【国际版】";
+    const next = (gw === "auto" ? "intl" : (gw === "intl" ? "cn" : "auto"));
+    window.NEXT_GATEWAY_REALM = next;
+    btnToggle.textContent = "切换网关上游为【" + realmLabel(next) + "】";
   }
 
   const btnCheckin = document.getElementById("btnCheckin");
-  if(btnCheckin) btnCheckin.style.display = (window.VIEW_REALM === "cn" ? "inline-block" : "none");
+  if(btnCheckin) btnCheckin.style.display = (view === "cn" ? "inline-block" : "none");
 };
 
 async function switchViewRealm(r){
@@ -755,15 +803,19 @@ async function switchViewRealm(r){
 };
 
 async function toggleActiveGatewayRealm(){
-  const next = (window.ACTIVE_GATEWAY_REALM === "intl" ? "cn" : "intl");
+  const next = window.NEXT_GATEWAY_REALM
+    || (window.ACTIVE_GATEWAY_REALM === "auto" ? "intl" : "auto");
   try {
     const res = await postJSON("/realm", {realm: next});
     window.ACTIVE_GATEWAY_REALM = res.current || next;
-    toast("网关默认上游已切换并永久保存为: " + (window.ACTIVE_GATEWAY_REALM === "intl" ? "国际版" : "国内版"));
+    toast("网关路由已切换并永久保存为: " + realmLabel(window.ACTIVE_GATEWAY_REALM));
     window.VIEW_REALM = window.ACTIVE_GATEWAY_REALM;
     window.updateUI();
     await loadAccounts();
     await loadModels();
+    await loadGrowthTasks();
+    await loadSchedulerStatus();
+    await loadAnalytics();
     await refresh();
   }catch(e){
     alert("切换失败: " + e.message);
@@ -774,7 +826,10 @@ async function initRealm(){
   try {
     const r = await getJSON("/realm");
     if(r && r.current) window.ACTIVE_GATEWAY_REALM = r.current;
+    if(r && Array.isArray(r.options)) window.REALM_OPTIONS = r.options;
   } catch(e){}
+  // Start the view on the gateway's actual mode so the page never shows one
+  // realm while routing happens in another.
   window.VIEW_REALM = window.ACTIVE_GATEWAY_REALM;
   window.updateUI();
 }

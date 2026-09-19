@@ -855,24 +855,55 @@ class MainWindow(QMainWindow):
         self.task_mode = hint_label("")
         controls.body.addWidget(self.task_mode)
 
+        # Account picker: the manual actions below act on one domestic account,
+        # but "全部国内版账号" is the common case so it stays the default.
+        pick_row = QHBoxLayout()
+        pick_row.addWidget(QLabel("目标账号"))
+        self.task_account = QComboBox()
+        self.task_account.setMinimumWidth(280)
+        pick_row.addWidget(self.task_account, 1)
+        self.refresh_task_accounts_button = QPushButton("刷新账号列表")
+        self.refresh_task_accounts_button.setProperty("variant", "secondary")
+        self.refresh_task_accounts_button.clicked.connect(
+            self.refresh_task_accounts)
+        pick_row.addWidget(self.refresh_task_accounts_button)
+        controls.body.addLayout(pick_row)
+
         buttons = QHBoxLayout()
-        self.scheduler_toggle_button = QPushButton("启用 / 暂停")
+        self.scheduler_toggle_button = QPushButton("启用 / 暂停排程")
         self.scheduler_toggle_button.setProperty("variant", "secondary")
         self.scheduler_toggle_button.clicked.connect(self.do_toggle_scheduler)
-        self.run_tasks_button = QPushButton("立即执行一次")
+        self.run_tasks_button = QPushButton("立即执行全部任务")
         self.run_tasks_button.clicked.connect(self.do_run_tasks_now)
-        self.refresh_tasks_button = QPushButton("刷新")
-        self.refresh_tasks_button.setProperty("variant", "secondary")
-        self.refresh_tasks_button.clicked.connect(self.refresh_tasks)
         buttons.addWidget(self.scheduler_toggle_button)
         buttons.addWidget(self.run_tasks_button)
         buttons.addStretch(1)
-        buttons.addWidget(self.refresh_tasks_button)
         controls.body.addLayout(buttons)
+
+        # The three actions the web panel exposes but this window lacked. They
+        # matter because the scheduled run is once or twice a day; if it fails
+        # there is otherwise no way to retry without opening a browser.
+        manual = QHBoxLayout()
+        self.checkin_button = QPushButton("手动签到")
+        self.checkin_button.clicked.connect(self.do_checkin)
+        self.growth_button = QPushButton("执行成长任务")
+        self.growth_button.clicked.connect(self.do_run_growth)
+        self.travel_button = QPushButton("猫猫旅行")
+        self.travel_button.clicked.connect(self.do_travel)
+        self.refresh_tasks_button = QPushButton("刷新")
+        self.refresh_tasks_button.setProperty("variant", "secondary")
+        self.refresh_tasks_button.clicked.connect(self.refresh_tasks)
+        for button in (self.checkin_button, self.growth_button,
+                       self.travel_button):
+            manual.addWidget(button)
+        manual.addStretch(1)
+        manual.addWidget(self.refresh_tasks_button)
+        controls.body.addLayout(manual)
+
         controls.body.addWidget(hint_label(
             "国内版账号会按排程自动签到、领取积分与派出猫猫旅行；"
-            "国际版账号只做令牌保活。全部操作走你自己的账号，"
-            "程序已内置防风控间隔。"))
+            "国际版账号只做令牌保活。上面的按钮用于立即手动执行一次，"
+            "全部操作走你自己的账号，程序已内置防风控间隔。"))
         layout.addWidget(controls)
 
         history = Panel("执行记录")
@@ -1142,6 +1173,7 @@ class MainWindow(QMainWindow):
         self.refresh_status()
         self.refresh_accounts()
         self.refresh_usage()
+        self.refresh_task_accounts()
         self.refresh_tasks()
         self.refresh_logs(True)
 
@@ -2052,6 +2084,7 @@ class MainWindow(QMainWindow):
                status.get("last_run_time") or "尚未运行",
                status.get("next_run_time") or "待调度"))
         self.task_mode.setText(status.get("mode") or "")
+        self.refresh_task_accounts()
         logs = status.get("logs") or []
         self.task_log.setPlainText("\n".join(logs[-60:]) if logs
                                    else "（暂无执行记录）")
@@ -2083,6 +2116,161 @@ class MainWindow(QMainWindow):
             return
         self.set_status((result or {}).get("msg") or "已触发")
         QTimer.singleShot(2000, self.refresh_tasks)
+
+    # ------------------------------------------------- manual task actions
+    @Slot()
+    def refresh_task_accounts(self):
+        """Populate the account picker with domestic accounts.
+
+        Only domestic accounts appear: check-in, growth tasks and cat travel
+        are China-realm features, so an international account has nothing to
+        do here.
+        """
+        current = self.task_account.currentData()
+        self.task_account.clear()
+        self.task_account.addItem("全部国内版账号", "all")
+        pool = getattr(wb_proxy, "POOL", None)
+        if pool:
+            for account in pool.accounts:
+                if account.realm != "cn":
+                    continue
+                label = "%s  (%s)" % (account.nickname or account.uid[:8],
+                                      "已启用" if account.enabled else "已停用")
+                self.task_account.addItem(label, account.uid)
+        index = self.task_account.findData(current)
+        if index >= 0:
+            self.task_account.setCurrentIndex(index)
+
+    def _task_target_uid(self):
+        """The uid the manual actions act on, or "all"."""
+        return self.task_account.currentData() or "all"
+
+    def _run_task_action(self, label, work, on_done):
+        """Run an upstream task call off the UI thread and report the result."""
+        self.set_status("%s…" % label)
+
+        def done(result):
+            self.refresh_tasks()
+            self.refresh_task_accounts()
+            message = on_done(result)
+            if message:
+                self.set_status(label + "完成")
+                self.info(label, message)
+
+        self.run_async(work, done, lambda msg: self.fail(label + "失败", msg))
+
+    @Slot()
+    def do_checkin(self):
+        """Sign the selected domestic account(s) in for today."""
+        if getattr(wb_proxy, "POOL", None) is None:
+            self.info("服务未运行", "请先启动服务。")
+            return
+        uid = self._task_target_uid()
+
+        def work():
+            pool = wb_proxy.POOL
+            targets = ([pool.get(uid)] if uid != "all"
+                       else [a for a in pool.accounts if a.realm == "cn"])
+            out = []
+            for account in targets:
+                if account is None:
+                    continue
+                name = account.nickname or account.uid[:8]
+                try:
+                    result = account.checkin()
+                    out.append((name, bool(result.get("ok")),
+                                result.get("msg") or result.get("error") or ""))
+                except Exception as exc:
+                    out.append((name, False, str(exc)))
+            return out
+
+        def report(results):
+            if not results:
+                return "没有可签到的国内版账号。"
+            good = [r for r in results if r[1]]
+            lines = ["%s %s  %s" % ("OK " if ok else "--", name, msg)
+                     for name, ok, msg in results]
+            return "签到完成：成功 %d / %d\n\n%s" % (
+                len(good), len(results), "\n".join(lines))
+
+        self._run_task_action("签到", work, report)
+
+    @Slot()
+    def do_run_growth(self):
+        """Run the growth-task pass now instead of waiting for the schedule."""
+        if getattr(wb_proxy, "POOL", None) is None:
+            self.info("服务未运行", "请先启动服务。")
+            return
+        uid = self._task_target_uid()
+
+        def work():
+            from wb_tasks import run_growth_tasks
+            pool = wb_proxy.POOL
+            targets = ([pool.get(uid)] if uid != "all"
+                       else [a for a in pool.accounts
+                             if a.realm == "cn" and a.enabled])
+            out = []
+            for account in targets:
+                if account is None:
+                    continue
+                name = account.nickname or account.uid[:8]
+                try:
+                    result = run_growth_tasks(account)
+                    out.append((name, bool(result.get("ok", True)),
+                                result.get("logs") or result.get("msg") or ""))
+                except Exception as exc:
+                    out.append((name, False, str(exc)))
+            return out
+
+        def report(results):
+            if not results:
+                return "没有可用的国内版账号。"
+            parts = []
+            for name, ok, detail in results:
+                head = "%s %s" % ("OK " if ok else "--", name)
+                if isinstance(detail, list) and detail:
+                    head += "\n  " + "\n  ".join(str(d) for d in detail[-6:])
+                elif detail:
+                    head += "\n  " + str(detail)
+                parts.append(head)
+            return "成长任务执行完毕\n\n" + "\n\n".join(parts)
+
+        self._run_task_action("执行成长任务", work, report)
+
+    @Slot()
+    def do_travel(self):
+        """Dispatch or collect the cat travel reward."""
+        if getattr(wb_proxy, "POOL", None) is None:
+            self.info("服务未运行", "请先启动服务。")
+            return
+        uid = self._task_target_uid()
+
+        def work():
+            from wb_tasks import do_cat_travel
+            pool = wb_proxy.POOL
+            targets = ([pool.get(uid)] if uid != "all"
+                       else [a for a in pool.accounts
+                             if a.realm == "cn" and a.enabled])
+            out = []
+            for account in targets:
+                if account is None:
+                    continue
+                name = account.nickname or account.uid[:8]
+                try:
+                    result = do_cat_travel(account)
+                    out.append((name, result.get("action") or "?",
+                                result.get("msg") or result.get("error") or ""))
+                except Exception as exc:
+                    out.append((name, "error", str(exc)))
+            return out
+
+        def report(results):
+            if not results:
+                return "没有可用的国内版账号。"
+            lines = ["%s  %s" % (name, msg) for name, _a, msg in results]
+            return "猫猫旅行处理完毕\n\n" + "\n".join(lines)
+
+        self._run_task_action("猫猫旅行", work, report)
 
     # --------------------------------------------------------------- settings
     def do_toggle_autostart(self, checked):
