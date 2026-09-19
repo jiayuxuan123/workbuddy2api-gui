@@ -29,6 +29,7 @@ import urllib.request
 import uuid
 import wb_accounts
 import wb_catalog
+import wb_health
 import wb_runtime
 import wb_settings
 import wb_usagelog
@@ -1750,14 +1751,32 @@ def open_upstream(payload, session_key=None, target_realm=None):
         # client as a 502 and cooled the account down for 60s, so one blip cost
         # both the request and the capacity to serve the next one.
         for attempt in range(1, CHAT_NETWORK_RETRIES + 1):
+            # Claim the right to send from the account's breaker (cc-switch
+            # semantics). In HALF_OPEN only one probe request may be in
+            # flight, and whether THIS attempt consumed that slot decides how
+            # its outcome is recorded below - keep the flag next to the claim.
+            breaker = wb_health.ACCOUNTS.get(account.uid)
+            allowed, used_probe = breaker.allow_request()
+            if not allowed:
+                # The breaker tripped between pick() and here (another
+                # thread's failures). Skip to the next account.
+                if session_key and POOL:
+                    POOL.affinity.unbind(session_key)
+                last_error = last_error or RuntimeError(
+                    "circuit breaker open for account %s" % account.uid[:8])
+                break
             req = urllib.request.Request(chat_url, data=body, method="POST",
                                          headers=account.headers(purpose="chat"))
             try:
                 resp = urllib.request.urlopen(req, timeout=600)
                 account.clear_error()
+                breaker.record_success(used_probe=used_probe)
                 return resp, account
             except urllib.error.HTTPError as exc:
                 if exc.code in (401, 403, 429):
+                    # Account-level rejection: the credential or the quota is
+                    # the problem, so it counts against the breaker too.
+                    breaker.record_failure(used_probe=used_probe, status=exc.code)
                     log("account %s rejected (HTTP %s), rotating" % (account.uid[:8], exc.code))
                     if session_key and POOL:
                         POOL.affinity.unbind(session_key)
@@ -1767,12 +1786,22 @@ def open_upstream(payload, session_key=None, target_realm=None):
                     last_error = exc
                     break               # account-level: move to the next one
                 if exc.code >= 500 and attempt < CHAT_NETWORK_RETRIES:
+                    # Shared-host trouble: neutral for the breaker, but the
+                    # probe slot must go back or half-open recovery wedges.
+                    if used_probe: breaker.release_probe()
                     log("upstream HTTP %s, retry %d/%d"
                         % (exc.code, attempt, CHAT_NETWORK_RETRIES))
                     time.sleep(CHAT_RETRY_BACKOFF * attempt)
                     continue
+                # 5xx after retries, or a request-level 4xx (bad params):
+                # raised to the caller, neutral for the breaker.
+                if used_probe: breaker.release_probe()
                 raise
             except Exception as exc:
+                # Transport trouble says nothing about the credential: every
+                # path here is neutral for the breaker, but the probe slot
+                # must be returned no matter which way we leave the loop.
+                if used_probe: breaker.release_probe()
                 if _is_transient_network_error(exc) and attempt < CHAT_NETWORK_RETRIES:
                     log("network fault (%s), retry %d/%d on the same account"
                         % (exc, attempt, CHAT_NETWORK_RETRIES))

@@ -10,6 +10,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import wb_health
 from wb_fingerprint import derive_id, generate_request_id
 
 
@@ -285,6 +286,12 @@ class Account(object):
         if not self.enabled or not self.access_token:
             return False
         if self.cooldown_until > time.time():
+            return False
+        # Circuit breaker gate (mirrors cc-switch): an OPEN breaker blocks the
+        # account entirely; HALF_OPEN still admits the single probe request.
+        # is_available() does not consume the probe slot - that happens in
+        # open_upstream() when the request is actually claimed.
+        if not wb_health.ACCOUNTS.get(self.uid).is_available():
             return False
         exp = self.expires_at or jwt_exp(self.access_token)
         if not exp:
@@ -644,7 +651,11 @@ class AccountPool(object):
         account = self.get(uid)
         if account is None: return None
         account.enabled = bool(enabled)
-        if enabled: account.clear_error()
+        if enabled:
+            account.clear_error()
+            # Re-enabling is an operator statement that the account is fine,
+            # so its breaker history is stale - force it closed.
+            wb_health.ACCOUNTS.reset(uid)
         account.save(self.dir)
         return account.public()
 
@@ -653,7 +664,9 @@ class AccountPool(object):
             for account in self.accounts:
                 if realm and account.realm != realm: continue
                 account.enabled = bool(enabled)
-                if enabled: account.clear_error()
+                if enabled:
+                    account.clear_error()
+                    wb_health.ACCOUNTS.reset(account.uid)
                 account.save(self.dir)
 
     def count_ready(self, realm=None):
@@ -683,6 +696,11 @@ class AccountPool(object):
             if not account.enabled or not account.access_token:
                 continue
             if account.cooldown_until > now:
+                continue
+            # Same breaker gate ready()/pick() apply: an OPEN breaker means
+            # the account cannot serve a request right now, and this method's
+            # whole point is to not overstate capacity.
+            if not wb_health.ACCOUNTS.get(account.uid).is_available(now):
                 continue
             exp = account.expires_at or jwt_exp(account.access_token)
             # No expiry on the token: treat it as usable, matching ready().
