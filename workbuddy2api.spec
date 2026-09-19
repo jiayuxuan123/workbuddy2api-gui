@@ -121,6 +121,60 @@ a = Analysis(
     noarchive=False,
 )
 
+# ---------------------------------------------------------------------------
+# Drop Qt components this application never uses.
+#
+# PyInstaller's PySide6 hook collects a broad set of Qt libraries regardless of
+# the `excludes` list above - those entries stop Python imports, not the shared
+# libraries the hook copies. Removing them afterwards is the reliable point of
+# intervention.
+#
+# Every entry below was verified by removing it from a working installation and
+# confirming the app still starts, serves /health and renders its window (see
+# _probe_trim.py). opengl32sw.dll alone is 19.7 MB of software-rendered OpenGL
+# that a 2D widget UI never touches.
+UNUSED_QT_FILES = {
+    "opengl32sw.dll",     # software OpenGL; the UI is plain 2D widgets
+    "qt6quick.dll",       # QML runtime - this app uses QtWidgets
+    "qt6qml.dll",         # QML engine
+    "qt6qmlmodels.dll",   # QML models
+    "qt6qmlworkerscript.dll",
+    "qt6pdf.dll",         # PDF rendering
+    "qt6network.dll",     # networking goes through Python's urllib
+    "qt6opengl.dll",      # OpenGL wrapper
+    "qt6openglwidgets.dll",
+    "qt6sql.dll",         # no database
+    "qt6test.dll",        # no Qt test framework at runtime
+    "qt6designer.dll",
+    "qt6help.dll",
+    "qt6charts.dll",
+    "qt6multimedia.dll",
+    "qt6websockets.dll",
+    "qt6serialport.dll",
+    "qt6bluetooth.dll",
+}
+
+#: Whole directories that are safe to drop.
+UNUSED_QT_DIRS = ("translations", "qml", "translations/qtwebengine_locales")
+
+
+def _is_unused(name):
+    """True when a collected file belongs to an unused Qt component."""
+    lowered = name.replace("\\", "/").lower()
+    base = os.path.basename(lowered)
+    if base in UNUSED_QT_FILES:
+        return True
+    for part in UNUSED_QT_DIRS:
+        if ("/%s/" % part) in lowered or lowered.endswith("/" + part):
+            return True
+    return False
+
+
+_before = len(a.binaries)
+a.binaries = [entry for entry in a.binaries if not _is_unused(entry[0])]
+_dropped = _before - len(a.binaries)
+print("spec: dropped %d unused Qt binaries (%d kept)" % (_dropped, len(a.binaries)))
+
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
 if ONEFILE:
