@@ -1,11 +1,40 @@
-test: exercise the update path through the product's own extractor
+feat: point other AI clients at this gateway (provider switching)
 
-The fixture installation is now built by writing a zip and letting
-wb_update.extract_zip() create the files, instead of writing paths directly in
-the test. Two reasons: every location stays inside the scratch directory made
-in this file, and the setup travels the same code path a real update does.
+Adds the capability that makes cc-switch useful: instead of hand-editing each
+tool's JSON or TOML, write this gateway into the client's own config file and
+switch back with one click.
 
-Also corrects an assertion: the backup covers the user's data only
-(accounts, usage, gateway.json). The program files are replaced wholesale from
-the download, so keeping a second copy of them would only double the disk cost.
-The test now asserts that, rather than expecting program files in the backup.
+Supported clients and their formats:
+
+  Claude Code   ~/.claude/settings.json   env.ANTHROPIC_BASE_URL / AUTH_TOKEN
+  Codex CLI     ~/.codex/config.toml      model_provider + provider table,
+                                          key in auth.json
+  Gemini CLI    ~/.gemini/.env            GOOGLE_GEMINI_BASE_URL / API_KEY
+
+Behaviour that matters:
+
+  - only the gateway's own keys are written; the user's model choice, theme and
+    other settings are preserved
+  - the original file is backed up the first time it is touched, and can be
+    restored from the panel
+  - a file that is not valid JSON/TOML is refused rather than overwritten, so a
+    hand-edited config is never silently destroyed
+  - re-applying is idempotent: one provider table, one model_provider line
+  - the port comes from the live gateway when it is running, otherwise the saved
+    preference, resolved the same way when writing and when detecting
+
+Three real bugs were found and fixed while building this:
+
+  - a top-level TOML key was appended at the end of the file, which puts it
+    inside the last table. Codex reads model_provider from the root, so the
+    setting was invisible - now inserted before the first table header.
+  - detection compared against the default port while apply() wrote the
+    supplied one, so a client correctly pointing at us reported "not us".
+    Both directions now resolve the port identically.
+  - wb_gateway now exposes ACTIVE_PORT, so modules can read the port the
+    gateway is actually on rather than re-deriving it from a preferences file
+    that may be stale or belong to another directory.
+
+Tests: a 42-check suite covering all three formats, preservation of user
+settings, idempotent re-apply, backup and restore, refusal of corrupt files,
+and the path guard that keeps writes inside the client's own folder.

@@ -298,6 +298,13 @@ def existing_instance(port, host="127.0.0.1"):
     return None
 
 
+#: Port the in-process gateway is listening on, or None when it is stopped.
+#: Set by Gateway.start() so other modules (the client-config writer, the tray
+#: wrapper) can read the live value instead of re-deriving it from the saved
+#: preferences - which may be absent, stale, or from another directory.
+ACTIVE_PORT = None
+
+
 class Gateway(object):
     """Owns the HTTP server thread and the scheduler for one process."""
 
@@ -405,6 +412,8 @@ class Gateway(object):
             self._thread = thread
             self.started_at = time.time()
             self.last_error = ""
+            global ACTIVE_PORT
+            ACTIVE_PORT = port
             thread.start()
 
             # Give the socket a moment so an immediate failure is reported now
@@ -512,6 +521,8 @@ class Gateway(object):
         if thread is not None:
             thread.join(timeout=5)
         self.started_at = 0.0
+        global ACTIVE_PORT
+        ACTIVE_PORT = None
         wb_proxy.log("gateway   : stopped")
         return True, "已停止"
 
