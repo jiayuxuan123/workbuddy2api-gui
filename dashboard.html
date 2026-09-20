@@ -2871,18 +2871,27 @@ function breakerStateBadge(st){
 function renderBreakers(breakers){
   const section = document.getElementById('breakerSection');
   if(!section) return;
-  // Open / half-open breakers keep the block always visible; a fully healthy
-  // pool collapses to one compact row so the page is not dominated by green.
-  const trouble = (breakers || []).filter(b => b.state !== 'closed');
-  section.style.display = (breakers && breakers.length && trouble.length) ? 'block' : 'none';
-  if(!breakers || !breakers.length) return;
+  const list = breakers || [];
+  if(!list.length){
+    // 还没有任何账号发过请求：不占位，避免空区块。
+    section.style.display = 'none';
+    return;
+  }
+  section.style.display = 'block';
   const em = document.getElementById('breakerCount');
-  if(em) em.textContent = '(' + breakers.length + ' 个账号)';
+  if(em) em.textContent = '(' + list.length + ' 个账号)';
   const wrap = document.getElementById('breakerList');
   if(!wrap) return;
+  // 全部闭合时只留一行摘要，异常账号才展开成卡片。
+  const trouble = list.filter(b => b.state !== 'closed');
+  if(!trouble.length){
+    wrap.innerHTML = '<div class="card" style="padding:10px 12px;font-size:12px;color:var(--dim);grid-column:1/-1">'
+      + '全部 ' + list.length + ' 个账号熔断器闭合，当前无熔断冷却</div>';
+    return;
+  }
   const acctMap = {};
   (window.ACCOUNTS || []).forEach(a => { acctMap[a.uid] = a; });
-  wrap.innerHTML = breakers.map(b => {
+  wrap.innerHTML = trouble.map(b => {
     const a = acctMap[b.key] || {};
     const name = a.nickname || (b.key || '').slice(0, 10) + '...';
     const realmBadge = a.realm === 'cn'
@@ -3178,7 +3187,9 @@ async function submitMcpUpsert(){
     const old = (MCP_DATA.servers || []).find(s => s.id === MCP_EDIT_ID);
     if(old) keepApps = old.apps || {};
   }
-  const payload = {
+  // 端点的载荷是「库记录」本身：{server: {id, name, server: <规格>, apps}}。
+  // 规格嵌在记录的 server 字段里，别把 id/name 放在顶层（那样后端拿不到 id）。
+  const record = {
     id: sid,
     name: name,
     description: document.getElementById('mcpFDesc').value.trim(),
@@ -3188,7 +3199,7 @@ async function submitMcpUpsert(){
       : {type: 'stdio', command: cmd, args: args, env: env},
   };
   try{
-    await postJSON('/mcp/upsert', payload);
+    await postJSON('/mcp/upsert', {server: record});
     toast(MCP_EDIT_ID ? '已保存' : '已添加');
     closeMcpUpsert();
     await loadMcp();
@@ -3202,25 +3213,34 @@ let SESS_PROVIDER = 'claude';
 let SESS_ALL = [];         // /sessions 一次返回三家，前端按 provider_id 过滤
 let SESS_CURRENT = null;   // 正在查看消息的会话
 
-function setSessionProvider(p){
-  SESS_PROVIDER = p;
+function syncSessionProviderButtons(){
   ['claude', 'codex', 'gemini'].forEach(x => {
     const btn = document.getElementById('btnSessProv' + x.charAt(0).toUpperCase() + x.slice(1));
-    if(btn) btn.classList.toggle('active', x === p);
+    if(btn) btn.classList.toggle('active', x === SESS_PROVIDER);
   });
+}
+
+function setSessionProvider(p){
+  SESS_PROVIDER = p;
+  syncSessionProviderButtons();
   renderSessions();
 }
 
 function sessFmtTime(ts){
   if(!ts) return '—';
-  const d = new Date(ts * 1000);
+  // 后端 _ts_to_ms 统一输出毫秒；老数据若给秒级也按同一判据兼容。
+  const n = Number(ts);
+  if(!isFinite(n)) return esc(String(ts));
+  const msVal = n > 1e12 ? n : n * 1000;
+  const d = new Date(msVal);
   if(isNaN(d.getTime())) return esc(String(ts));
-  const pad = n => String(n).padStart(2, '0');
+  const pad = n2 => String(n2).padStart(2, '0');
   return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate())
     + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
 }
 
 async function loadSessions(){
+  syncSessionProviderButtons();
   try{
     const r = await getJSON('/sessions');
     SESS_ALL = r.sessions || [];
