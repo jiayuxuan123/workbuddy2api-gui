@@ -2900,6 +2900,10 @@ class Handler(BaseHTTPRequestHandler):
         # Session management scans the user's home CLI directories.
         if path.startswith("/sessions"):
             return True
+        # Custom model provider library: writes touch the data dir and the
+        # probe performs an outbound request, so the panel password gates it.
+        if path.startswith("/providers/custom"):
+            return True
         # Exact match on purpose: /health itself must stay public because the
         # launcher uses it to detect a running copy.
         if path == "/health/breakers":
@@ -3001,6 +3005,14 @@ class Handler(BaseHTTPRequestHandler):
             for a in (POOL.accounts if POOL else []):
                 a.fetch_credits()
             return self._json(200, {"accounts": account_views()})
+        if path == "/providers/custom":
+            # Library listing only; writes and probing are POST-only.
+            import wb_custom_providers
+            try:
+                providers = wb_custom_providers.list_providers()
+            except Exception as exc:
+                return self._error(500, "failed to list providers: %s" % exc)
+            return self._json(200, {"providers": providers})
         if path == "/accounts":
             if not self._authorized():
                 return
@@ -3731,6 +3743,98 @@ class Handler(BaseHTTPRequestHandler):
 
         return self._error(404, "unknown mcp endpoint", "invalid_request_error")
 
+    def _handle_custom_providers(self, path, payload):
+        """Custom model provider library: CRUD + outbound model probe."""
+        try:
+            import wb_custom_providers
+        except Exception as exc:
+            return self._error(500, "provider module unavailable: %s" % exc)
+
+        def _fail(exc):
+            if isinstance(exc, wb_custom_providers.ProviderError):
+                return self._error(400, str(exc), "invalid_request_error")
+            return self._error(500, "provider operation failed: %s" % exc)
+
+        if path == "/providers/custom/upsert":
+            pid = str(payload.get("id") or "").strip()
+            if not pid:
+                # 前端允许留空 id：用名称或时间生成一个稳定可读的。
+                name = str(payload.get("name") or "").strip()
+                pid = ("prov-" + re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:24]
+                       if name else "")
+                if not pid:
+                    pid = "prov-%d" % int(time.time())
+                payload["id"] = pid
+            try:
+                cleaned, created = wb_custom_providers.upsert_provider(payload)
+            except Exception as exc:
+                return _fail(exc)
+            # 回传脱敏后的记录，避免把完整 key 泄回前端。
+            masked = wb_custom_providers.list_providers()
+            for item in masked:
+                if item["id"] == cleaned["id"]:
+                    cleaned = item
+                    break
+            log("providers: %s custom provider %s (%s)"
+                % ("added" if created else "updated", cleaned["id"],
+                   cleaned["protocol"]))
+            return self._json(200, {"ok": True, "created": created,
+                                    "provider": cleaned})
+
+        if path == "/providers/custom/delete":
+            pid = str(payload.get("id") or "").strip()
+            if not pid:
+                return self._error(400, "id required", "invalid_request_error")
+            try:
+                wb_custom_providers.delete_provider(pid)
+            except Exception as exc:
+                return _fail(exc)
+            log("providers: deleted custom provider %s" % pid)
+            return self._json(200, {"ok": True, "deleted": pid})
+
+        if path == "/providers/custom/set":
+            pid = str(payload.get("id") or "").strip()
+            if not pid:
+                return self._error(400, "id required", "invalid_request_error")
+            try:
+                wb_custom_providers.set_enabled(pid, bool(payload.get("enabled")))
+            except Exception as exc:
+                return _fail(exc)
+            return self._json(200, {"ok": True})
+
+        if path == "/providers/custom/probe":
+            pid = str(payload.get("id") or "").strip()
+            if not pid:
+                return self._error(400, "id required", "invalid_request_error")
+            try:
+                wb_custom_providers.get_provider(pid)
+            except wb_custom_providers.ProviderError:
+                # 不存在的 id 是调用方错误（400），区别于探测时上游不可达（502）。
+                return self._error(400, "没有找到提供商：%s" % pid,
+                                   "invalid_request_error")
+            try:
+                provider = wb_custom_providers.probe_and_store(pid)
+            except wb_custom_providers.ProviderError as exc:
+                return self._error(502, str(exc))
+            except Exception as exc:
+                return _fail(exc)
+            log("providers: probed %s -> %d models"
+                % (pid, len(provider.get("models") or [])))
+            # 脱敏回传（provider 里的 api_key 是完整值）。
+            provider = dict(provider)
+            key = provider.get("api_key") or ""
+            provider["api_key"] = (key[:4] + "***" + key[-4:]) if len(key) > 8 \
+                else ("***" if key else "")
+            return self._json(200, {
+                "ok": True,
+                "models": provider.get("models") or [],
+                "tried": (provider.get("last_probe") or {}).get("tried") or [],
+                "provider": provider,
+            })
+
+        return self._error(404, "unknown provider endpoint",
+                           "invalid_request_error")
+
     def _handle_responses(self, payload):
         """Serve /v1/responses by translating to chat completions upstream."""
         session_key = extract_session_key(self.headers, payload)
@@ -3838,6 +3942,16 @@ class Handler(BaseHTTPRequestHandler):
             if payload is None:
                 return
             return self._handle_mcp(path, payload)
+        if path.startswith("/providers/custom/"):
+            # Custom model provider library: CRUD plus the model probe, which
+            # performs an outbound request — panel password required.
+            if not self._panel_ok():
+                return self._error(401, "panel password required",
+                                   "invalid_request_error")
+            payload = self._payload_or_error()
+            if payload is None:
+                return
+            return self._handle_custom_providers(path, payload)
         if path == "/usage/cost/refresh":
             # Forced re-pull of the remote price list (LiteLLM/OpenRouter).
             # Read-only for local data but performs an outbound fetch, so

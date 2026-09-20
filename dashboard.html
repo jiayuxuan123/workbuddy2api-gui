@@ -201,6 +201,9 @@ a:hover{text-decoration:underline}
       <button class="main-nav-btn" id="btnNavMcp" onclick="switchMainTab('mcp')">
         MCP 管理
       </button>
+      <button class="main-nav-btn" id="btnNavCustomProv" onclick="switchMainTab('customprov')">
+        模型提供商
+      </button>
       <button class="main-nav-btn" id="btnNavSessions" onclick="switchMainTab('sessions')">
         会话
       </button>
@@ -662,6 +665,75 @@ a:hover{text-decoration:underline}
     </div>
   </div>
   <div id="sessionsList" style="overflow-x:auto"></div>
+</div>
+
+<div id="pageCustomProv" style="display:none">
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:8px">
+    <div>
+      <h2 style="margin:0;font-size:16px;color:var(--fg)">模型提供商</h2>
+      <div style="font-size:12px;color:var(--dim);margin-top:4px">
+        接入第三方 AI API（OpenAI 兼容 / Anthropic / Gemini 协议），加完后可自动探寻该商的模型列表
+      </div>
+    </div>
+    <button onclick="openProvUpsert()">新增提供商</button>
+  </div>
+  <div id="provList" style="overflow-x:auto"></div>
+</div>
+
+<div class="modal-mask" id="provUpsertModal">
+  <div class="modal" role="dialog" aria-modal="true" style="width:min(560px,100%)">
+    <div class="modal-hd">
+      <h2 id="provUpsertTitle">新增模型提供商</h2>
+      <button class="modal-x" onclick="closeProvUpsert()" aria-label="关闭">×</button>
+    </div>
+    <div class="modal-bd">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+        <label style="font-size:12px;color:var(--dim)">名称*
+          <input id="provFName" placeholder="如 硅基流动" style="width:100%;margin-top:4px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:8px 10px;color:var(--fg);font:inherit">
+        </label>
+        <label style="font-size:12px;color:var(--dim)">协议
+          <select id="provFProtocol" style="width:100%;margin-top:4px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:8px 10px;color:var(--fg);font:inherit">
+            <option value="openai">OpenAI 兼容（绝大多数聚合站/官方 API）</option>
+            <option value="anthropic">Anthropic（Claude 协议）</option>
+            <option value="gemini">Gemini（Google 协议）</option>
+          </select>
+        </label>
+      </div>
+      <label style="display:block;font-size:12px;color:var(--dim);margin-top:10px">Base URL*
+        <input id="provFBaseUrl" placeholder="https://api.siliconflow.cn（一般不带 /v1，填根地址即可）" style="width:100%;margin-top:4px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:8px 10px;color:var(--fg);font:inherit">
+      </label>
+      <label id="provKeyRow" style="display:block;font-size:12px;color:var(--dim);margin-top:10px">API Key
+        <input id="provFApiKey" placeholder="sk-..." style="width:100%;margin-top:4px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:8px 10px;color:var(--fg);font:inherit">
+      </label>
+      <label style="display:block;font-size:12px;color:var(--dim);margin-top:10px">模型端点覆盖（可选，一般留空自动推导）
+        <input id="provFModelsUrl" placeholder="完整 /v1/models 地址；仅当自动推导失败时填" style="width:100%;margin-top:4px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:8px 10px;color:var(--fg);font:inherit">
+      </label>
+      <label style="display:block;font-size:12px;color:var(--dim);margin-top:10px">备注
+        <input id="provFNotes" style="width:100%;margin-top:4px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:8px 10px;color:var(--fg);font:inherit">
+      </label>
+      <div id="provUpsertMsg" style="font-size:12px;color:var(--bad);min-height:16px;margin-top:8px"></div>
+    </div>
+    <div class="modal-ft">
+      <button class="sec" onclick="closeProvUpsert()">取消</button>
+      <button onclick="submitProvUpsert()">保存</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-mask" id="provModelsModal">
+  <div class="modal" role="dialog" aria-modal="true" style="width:min(640px,100%)">
+    <div class="modal-hd">
+      <h2 id="provModelsTitle">模型列表</h2>
+      <button class="modal-x" onclick="closeProvModels()" aria-label="关闭">×</button>
+    </div>
+    <div class="modal-bd">
+      <div id="provModelsMeta" style="font-size:12px;color:var(--dim);margin-bottom:10px"></div>
+      <div id="provModelsBody" style="max-height:56vh;overflow-y:auto"></div>
+    </div>
+    <div class="modal-ft">
+      <button class="sec" onclick="closeProvModels()">关闭</button>
+    </div>
+  </div>
 </div>
 
 <div class="modal-mask" id="mcpUpsertModal">
@@ -2440,6 +2512,7 @@ function switchMainTab(tab){
   const btnMcp = document.getElementById('btnNavMcp');
   const btnSessions = document.getElementById('btnNavSessions');
   const btnSettings = document.getElementById('btnNavSettings');
+  const btnCustomProv = document.getElementById('btnNavCustomProv');
   const pageGateway = document.getElementById('pageGateway');
   const pageAnalytics = document.getElementById('pageAnalytics');
   const pageLogs = document.getElementById('pageLogs');
@@ -2447,12 +2520,14 @@ function switchMainTab(tab){
   const pageMcp = document.getElementById('pageMcp');
   const pageSessions = document.getElementById('pageSessions');
   const pageSettings = document.getElementById('pageSettings');
+  const pageCustomProv = document.getElementById('pageCustomProv');
   const tabs = [
     ['gateway', btnGateway, pageGateway],
     ['analytics', btnAnalytics, pageAnalytics],
     ['logs', btnLogs, pageLogs],
     ['clients', btnClients, pageClients],
     ['mcp', btnMcp, pageMcp],
+    ['customprov', btnCustomProv, pageCustomProv],
     ['sessions', btnSessions, pageSessions],
     ['settings', btnSettings, pageSettings]
   ];
@@ -2465,6 +2540,7 @@ function switchMainTab(tab){
   if(tab === 'analytics') loadAnalytics();
   if(tab === 'clients') loadClients();
   if(tab === 'mcp') loadMcp();
+  if(tab === 'customprov') loadProv();
   if(tab === 'sessions') loadSessions();
   if(tab === 'settings') loadSettings();
   if(tab === 'logs'){
@@ -3004,6 +3080,184 @@ async function refreshPricing(btn){
     toast('刷新价目表失败: ' + e.message, 'err');
   }finally{
     if(btn){ btn.disabled = false; btn.textContent = '刷新价目表'; }
+  }
+}
+
+/* ---------------------------- 模型提供商管理 ---------------------------- */
+let PROV_DATA = [];        // /providers/custom 返回的提供商列表
+let PROV_EDIT_ID = null;   // null = 新增；非空 = 编辑该 id
+const PROV_PROTOCOL_NAMES = {openai: 'OpenAI 兼容', anthropic: 'Anthropic', gemini: 'Gemini'};
+
+async function loadProv(){
+  try{
+    const r = await getJSON('/providers/custom');
+    PROV_DATA = r.providers || [];
+  }catch(e){
+    if(String(e.message) !== 'unauthorized')
+      toast('加载模型提供商失败: ' + e.message, true);
+    return;
+  }
+  renderProv();
+}
+
+function renderProv(){
+  const wrap = document.getElementById('provList');
+  if(!wrap) return;
+  if(!PROV_DATA.length){
+    wrap.innerHTML = '<div class="empty">还没有第三方提供商，点击右上角「新增提供商」接入 OpenAI 兼容 / Anthropic / Gemini 协议的 API</div>';
+    return;
+  }
+  wrap.innerHTML = '<table><thead><tr>'
+    + '<th>名称</th><th>协议 / 地址</th><th style="width:120px">模型</th><th style="width:90px">状态</th><th style="width:250px">操作</th>'
+    + '</tr></thead><tbody>'
+    + PROV_DATA.map(p => {
+        const probe = p.last_probe;
+        const probeInfo = probe
+          ? ('探寻于 ' + new Date((probe.at || 0) * 1000).toLocaleString())
+          : '未探寻';
+        // 操作按钮通过 data-id + 事件委托回传，避免把 id 拼进内联 onclick。
+        return '<tr>'
+          + '<td style="text-align:left"><b>' + esc(p.name || p.id) + '</b>'
+          +   (p.notes ? '<div style="font-size:11px;color:var(--dim)">' + esc(String(p.notes).slice(0, 50)) + '</div>' : '')
+          + '</td>'
+          + '<td class="mono" style="text-align:left;max-width:320px;word-break:break-all;font-size:12px">'
+          +   '<span class="badge" style="font-size:10px;margin-right:6px">' + esc(PROV_PROTOCOL_NAMES[p.protocol] || p.protocol) + '</span>'
+          +   esc(p.base_url || '—') + '</td>'
+          + '<td style="font-size:12px">' + (p.models || []).length + ' 个'
+          +   '<div style="font-size:10px;color:var(--dim)">' + esc(probeInfo) + '</div></td>'
+          + '<td>' + (p.enabled ? '<span class="badge ok">启用</span>' : '<span class="badge">停用</span>') + '</td>'
+          + '<td style="white-space:nowrap">'
+          +   '<button class="sec" style="font-size:11px;padding:4px 10px" data-act="probe" data-id="' + esc(p.id) + '">探寻模型</button> '
+          +   '<button class="sec" style="font-size:11px;padding:4px 10px" data-act="models" data-id="' + esc(p.id) + '">查看</button> '
+          +   '<button class="sec" style="font-size:11px;padding:4px 10px" data-act="toggle" data-id="' + esc(p.id) + '">' + (p.enabled ? '停用' : '启用') + '</button> '
+          +   '<button class="sec" style="font-size:11px;padding:4px 10px" data-act="edit" data-id="' + esc(p.id) + '">编辑</button> '
+          +   '<button class="sec" style="font-size:11px;padding:4px 10px;color:var(--bad)" data-act="delete" data-id="' + esc(p.id) + '">删除</button>'
+          + '</td>'
+          + '</tr>';
+      }).join('')
+    + '</tbody></table>';
+  // 事件委托：一次绑定，行内按钮全部通过 data-act 分发。
+  if(!wrap.dataset.delegated){
+    wrap.addEventListener('click', ev => {
+      const btn = ev.target.closest('button[data-act]');
+      if(!btn) return;
+      const rec = PROV_DATA.find(p => p.id === btn.dataset.id);
+      if(!rec) return;
+      if(btn.dataset.act === 'probe') probeProv(rec, btn);
+      else if(btn.dataset.act === 'models') showProvModels(rec);
+      else if(btn.dataset.act === 'toggle') toggleProv(rec);
+      else if(btn.dataset.act === 'edit') openProvUpsert(rec);
+      else if(btn.dataset.act === 'delete') deleteProv(rec);
+    });
+    wrap.dataset.delegated = '1';
+  }
+}
+
+function openProvUpsert(rec){
+  PROV_EDIT_ID = rec ? rec.id : null;
+  document.getElementById('provUpsertTitle').textContent =
+    rec ? ('编辑提供商：' + (rec.name || rec.id)) : '新增模型提供商';
+  document.getElementById('provFName').value = rec ? (rec.name || '') : '';
+  document.getElementById('provFProtocol').value = rec ? (rec.protocol || 'openai') : 'openai';
+  document.getElementById('provFBaseUrl').value = rec ? (rec.base_url || '') : '';
+  // 编辑时 key 显示掩码；提交时原样回传，后端识别掩码即保留原值。
+  document.getElementById('provFApiKey').value = rec ? (rec.api_key || '') : '';
+  document.getElementById('provFModelsUrl').value = rec && rec.last_probe
+    ? '' : '';
+  document.getElementById('provFNotes').value = rec ? (rec.notes || '') : '';
+  document.getElementById('provUpsertMsg').textContent = '';
+  document.getElementById('provUpsertModal').style.display = 'flex';
+  document.getElementById('provFName').focus();
+}
+
+function closeProvUpsert(){
+  document.getElementById('provUpsertModal').style.display = 'none';
+  PROV_EDIT_ID = null;
+}
+
+async function submitProvUpsert(){
+  const msg = document.getElementById('provUpsertMsg');
+  const name = document.getElementById('provFName').value.trim();
+  const base_url = document.getElementById('provFBaseUrl').value.trim();
+  if(!name){ msg.textContent = '名称必填'; return; }
+  if(!base_url){ msg.textContent = 'Base URL 必填'; return; }
+  const payload = {
+    id: PROV_EDIT_ID || ('prov-' + Date.now()),
+    name: name,
+    protocol: document.getElementById('provFProtocol').value,
+    base_url: base_url,
+    api_key: document.getElementById('provFApiKey').value.trim(),
+    notes: document.getElementById('provFNotes').value.trim(),
+  };
+  try{
+    await postJSON('/providers/custom/upsert', payload);
+    toast(PROV_EDIT_ID ? '已保存' : '已添加');
+    closeProvUpsert();
+    await loadProv();
+  }catch(e){
+    msg.textContent = '保存失败: ' + e.message;
+  }
+}
+
+async function probeProv(rec, btn){
+  if(btn){ btn.disabled = true; btn.textContent = '探寻中…'; }
+  try{
+    const r = await postJSON('/providers/custom/probe', {id: rec.id});
+    const models = r.models || [];
+    rec.models = models;
+    rec.last_probe = {at: Date.now() / 1000, count: models.length, tried: r.tried || []};
+    toast('探寻到 ' + models.length + ' 个模型');
+    renderProv();
+    if(models.length) showProvModels(rec);
+  }catch(e){
+    alert('探寻失败: ' + e.message);
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = '探寻模型'; }
+  }
+}
+
+function showProvModels(rec){
+  document.getElementById('provModelsTitle').textContent =
+    '模型列表：' + (rec.name || rec.id);
+  const meta = document.getElementById('provModelsMeta');
+  const probe = rec.last_probe;
+  meta.textContent = (rec.protocol ? (PROV_PROTOCOL_NAMES[rec.protocol] || rec.protocol) + ' · ' : '')
+    + (rec.base_url || '') + ' · '
+    + ((rec.models || []).length) + ' 个模型'
+    + (probe && probe.tried ? (' · 最近端点: ' + probe.tried.map(t => (t.ok ? '✓ ' : '✗ ') + t.url).join('；')) : '');
+  const body = document.getElementById('provModelsBody');
+  const models = rec.models || [];
+  body.innerHTML = models.length
+    ? '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:6px">'
+      + models.map(m => '<div class="card mono" style="padding:6px 10px;font-size:12px;word-break:break-all">' + esc(m) + '</div>').join('')
+      + '</div>'
+    : '<div class="empty">还没有模型数据，点「探寻模型」自动拉取</div>';
+  document.getElementById('provModelsModal').style.display = 'flex';
+}
+
+function closeProvModels(){
+  document.getElementById('provModelsModal').style.display = 'none';
+}
+
+async function toggleProv(rec){
+  try{
+    await postJSON('/providers/custom/set',
+                   {id: rec.id, enabled: !rec.enabled});
+    rec.enabled = !rec.enabled;
+    renderProv();
+  }catch(e){
+    toast('操作失败: ' + e.message, true);
+  }
+}
+
+async function deleteProv(rec){
+  if(!confirm('确定删除提供商「' + (rec.name || rec.id) + '」？该操作不可恢复。')) return;
+  try{
+    await postJSON('/providers/custom/delete', {id: rec.id});
+    toast('已删除');
+    await loadProv();
+  }catch(e){
+    toast('删除失败: ' + e.message, true);
   }
 }
 
