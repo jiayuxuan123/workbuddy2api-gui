@@ -198,6 +198,12 @@ a:hover{text-decoration:underline}
       <button class="main-nav-btn" id="btnNavClients" onclick="switchMainTab('clients')">
         客户端接入
       </button>
+      <button class="main-nav-btn" id="btnNavMcp" onclick="switchMainTab('mcp')">
+        MCP 管理
+      </button>
+      <button class="main-nav-btn" id="btnNavSessions" onclick="switchMainTab('sessions')">
+        会话
+      </button>
       <button class="main-nav-btn" id="btnNavSettings" onclick="switchMainTab('settings')">
         设置
       </button>
@@ -275,6 +281,17 @@ a:hover{text-decoration:underline}
   </div>
 
   <div class="cards" id="cards"></div>
+
+  <!-- 熔断器状态（随 refresh() 5s 轮询刷新） -->
+  <section id="breakerSection" style="display:none">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:8px">
+      <h2 style="margin:0">熔断器状态 <em id="breakerCount"></em></h2>
+      <div style="font-size:12px;color:var(--dim)">
+        连续失败达到阈值时自动熔断冷却，恢复后自动闭合；无重置操作
+      </div>
+    </div>
+    <div id="breakerList" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:10px"></div>
+  </section>
 
   <section>
     <h2>账号<em id="acctCount"></em></h2>
@@ -412,8 +429,19 @@ a:hover{text-decoration:underline}
       </div>
     </div>
 
-    <!-- 表格 1：各账号用量透视与各模型消耗明细 -->
-    
+    <!-- 表格 1：每日成本明细（/usage/cost） -->
+    <section id="costSection">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:8px">
+        <h2 style="margin:0">每日成本明细 <em id="costDayCount"></em></h2>
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          <span style="font-size:12px;color:var(--dim)" id="costPricingMeta"></span>
+          <button class="sec mini" id="btnCostRefresh" onclick="refreshPricing(this)">刷新价目表</button>
+        </div>
+      </div>
+      <div id="costTotals" style="display:grid;grid-auto-flow:column;grid-auto-columns:minmax(0,1fr);gap:8px;margin-bottom:12px"></div>
+      <div id="costTable" style="overflow-x:auto"></div>
+    </section>
+
 
     <!-- 表格 2：模型用量透视与响应指标 -->
     <section>
@@ -599,6 +627,100 @@ a:hover{text-decoration:underline}
   </div>
 
   <div id="clientsList"></div>
+</div>
+
+<div id="pageMcp" style="display:none">
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:8px">
+    <div>
+      <h2 style="margin:0;font-size:16px;color:var(--fg)">MCP 管理</h2>
+      <div style="font-size:12px;color:var(--dim);margin-top:4px">
+        统一管理 MCP 服务器库，并同步到 Claude / Codex / Gemini CLI 的配置文件
+      </div>
+    </div>
+    <div style="display:flex;gap:8px">
+      <button class="sec" onclick="mcpSync(this)">同步到客户端</button>
+      <button onclick="openMcpUpsert()">新增服务器</button>
+    </div>
+  </div>
+
+  <div id="mcpAppsBar" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin-bottom:14px"></div>
+  <div id="mcpList"></div>
+</div>
+
+<div id="pageSessions" style="display:none">
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:8px">
+    <div>
+      <h2 style="margin:0;font-size:16px;color:var(--fg)">会话</h2>
+      <div style="font-size:12px;color:var(--dim);margin-top:4px">
+        扫描本机 Claude Code / Codex / Gemini CLI 的历史会话，可查看消息、复制恢复命令或删除
+      </div>
+    </div>
+    <div style="display:flex;gap:4px;background:var(--panel2);padding:3px;border-radius:8px;border:1px solid var(--line)">
+      <button class="range-btn" id="btnSessProvClaude" onclick="setSessionProvider('claude')">Claude</button>
+      <button class="range-btn" id="btnSessProvCodex" onclick="setSessionProvider('codex')">Codex</button>
+      <button class="range-btn" id="btnSessProvGemini" onclick="setSessionProvider('gemini')">Gemini</button>
+    </div>
+  </div>
+  <div id="sessionsList" style="overflow-x:auto"></div>
+</div>
+
+<div class="modal-mask" id="mcpUpsertModal">
+  <div class="modal" role="dialog" aria-modal="true" style="width:min(560px,100%)">
+    <div class="modal-hd">
+      <h2 id="mcpUpsertTitle">新增 MCP 服务器</h2>
+      <button class="modal-x" onclick="closeMcpUpsert()" aria-label="关闭">×</button>
+    </div>
+    <div class="modal-bd">
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+        <label style="font-size:12px;color:var(--dim)">名称*
+          <input id="mcpFName" style="width:100%;margin-top:4px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:8px 10px;color:var(--fg);font:inherit">
+        </label>
+        <label style="font-size:12px;color:var(--dim)">类型
+          <select id="mcpFType" style="width:100%;margin-top:4px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:8px 10px;color:var(--fg);font:inherit" onchange="mcpTypeChanged()">
+            <option value="stdio">stdio (本地命令)</option>
+            <option value="http">http (远程 URL)</option>
+          </select>
+        </label>
+        <label id="mcpCmdRow" style="font-size:12px;color:var(--dim)">命令*
+          <input id="mcpFCmd" placeholder="如 npx" style="width:100%;margin-top:4px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:8px 10px;color:var(--fg);font:inherit">
+        </label>
+        <label id="mcpArgsRow" style="font-size:12px;color:var(--dim)">参数（每行一个）
+          <textarea id="mcpFArgs" rows="2" style="width:100%;margin-top:4px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:8px 10px;color:var(--fg);font:inherit;font-family:monospace"></textarea>
+        </label>
+        <label id="mcpUrlRow" style="display:none;font-size:12px;color:var(--dim)">URL*
+          <input id="mcpFUrl" placeholder="https://..." style="width:100%;margin-top:4px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:8px 10px;color:var(--fg);font:inherit">
+        </label>
+        <label style="font-size:12px;color:var(--dim)">描述
+          <input id="mcpFDesc" style="width:100%;margin-top:4px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:8px 10px;color:var(--fg);font:inherit">
+        </label>
+      </div>
+      <label style="display:block;font-size:12px;color:var(--dim);margin-top:10px">环境变量（每行 KEY=VALUE）
+        <textarea id="mcpFEnv" rows="2" style="width:100%;margin-top:4px;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:8px 10px;color:var(--fg);font:inherit;font-family:monospace"></textarea>
+      </label>
+      <div id="mcpUpsertMsg" style="font-size:12px;color:var(--bad);min-height:16px;margin-top:8px"></div>
+    </div>
+    <div class="modal-ft">
+      <button class="sec" onclick="closeMcpUpsert()">取消</button>
+      <button onclick="submitMcpUpsert()">保存</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-mask" id="sessionMsgModal">
+  <div class="modal" role="dialog" aria-modal="true" style="width:min(760px,100%)">
+    <div class="modal-hd">
+      <h2 id="sessionMsgTitle">会话消息</h2>
+      <button class="modal-x" onclick="closeSessionMsg()" aria-label="关闭">×</button>
+    </div>
+    <div class="modal-bd">
+      <div id="sessionMsgMeta" style="font-size:12px;color:var(--dim);margin-bottom:10px"></div>
+      <div id="sessionMsgBody" style="max-height:56vh;overflow-y:auto"></div>
+    </div>
+    <div class="modal-ft">
+      <button class="sec" onclick="copySessionResume(SESS_CURRENT)">复制恢复命令</button>
+      <button class="sec" onclick="closeSessionMsg()">关闭</button>
+    </div>
+  </div>
 </div>
 
 <div class="modal-mask" id="desktopScanModal">
@@ -1848,6 +1970,9 @@ async function refresh(){
         + '<td><b>' + fmt(r.total_tokens) + '</b></td>'
       + '</tr>').join('') + '</tbody></table>'
     : '<div class="empty">还没有请求记录</div>';
+
+  // 熔断状态跟主刷新同节奏（只读、失败静默）
+  fetchBreakers();
 }
 
 (async function initDashboard(){
@@ -1968,7 +2093,7 @@ async function startDashboard(){
   await refresh();
   await loadSettings();
   const tabFromUrl = new URLSearchParams(window.location.search).get('tab');
-  if(tabFromUrl && ['gateway', 'analytics', 'logs', 'settings'].includes(tabFromUrl)){
+  if(tabFromUrl && ['gateway', 'analytics', 'logs', 'clients', 'mcp', 'sessions', 'settings'].includes(tabFromUrl)){
     switchMainTab(tabFromUrl);
   }
   // Polling only starts after the panel is unlocked, so a locked browser
@@ -2312,17 +2437,23 @@ function switchMainTab(tab){
   const btnAnalytics = document.getElementById('btnNavAnalytics');
   const btnLogs = document.getElementById('btnNavLogs');
   const btnClients = document.getElementById('btnNavClients');
+  const btnMcp = document.getElementById('btnNavMcp');
+  const btnSessions = document.getElementById('btnNavSessions');
   const btnSettings = document.getElementById('btnNavSettings');
   const pageGateway = document.getElementById('pageGateway');
   const pageAnalytics = document.getElementById('pageAnalytics');
   const pageLogs = document.getElementById('pageLogs');
   const pageClients = document.getElementById('pageClients');
+  const pageMcp = document.getElementById('pageMcp');
+  const pageSessions = document.getElementById('pageSessions');
   const pageSettings = document.getElementById('pageSettings');
   const tabs = [
     ['gateway', btnGateway, pageGateway],
     ['analytics', btnAnalytics, pageAnalytics],
     ['logs', btnLogs, pageLogs],
     ['clients', btnClients, pageClients],
+    ['mcp', btnMcp, pageMcp],
+    ['sessions', btnSessions, pageSessions],
     ['settings', btnSettings, pageSettings]
   ];
   tabs.forEach(([name, btn, page]) => {
@@ -2333,6 +2464,8 @@ function switchMainTab(tab){
   });
   if(tab === 'analytics') loadAnalytics();
   if(tab === 'clients') loadClients();
+  if(tab === 'mcp') loadMcp();
+  if(tab === 'sessions') loadSessions();
   if(tab === 'settings') loadSettings();
   if(tab === 'logs'){
     startLogPolling();
@@ -2624,6 +2757,8 @@ async function loadAnalytics(){
   } catch(err) {
     console.error('loadAnalytics failed:', err);
   }
+  // 每日成本区块与指标透视同节奏刷新（失败静默）
+  loadCost();
 }
 
 function renderAnalytics(data){
@@ -2719,6 +2854,487 @@ function renderAnalytics(data){
           + '</tr>';
       }).join('');
     }
+  }
+}
+
+/* ------------------------------ 熔断器状态 ------------------------------ */
+function breakerStateBadge(st){
+  const map = {
+    closed:    ['ok',  '闭合'],
+    open:      ['bad', '熔断中'],
+    half_open: ['warn', '半开恢复'],
+  };
+  const m = map[st] || ['', st || '未知'];
+  return '<span class="badge ' + m[0] + '">' + esc(m[1]) + '</span>';
+}
+
+function renderBreakers(breakers){
+  const section = document.getElementById('breakerSection');
+  if(!section) return;
+  // Open / half-open breakers keep the block always visible; a fully healthy
+  // pool collapses to one compact row so the page is not dominated by green.
+  const trouble = (breakers || []).filter(b => b.state !== 'closed');
+  section.style.display = (breakers && breakers.length && trouble.length) ? 'block' : 'none';
+  if(!breakers || !breakers.length) return;
+  const em = document.getElementById('breakerCount');
+  if(em) em.textContent = '(' + breakers.length + ' 个账号)';
+  const wrap = document.getElementById('breakerList');
+  if(!wrap) return;
+  const acctMap = {};
+  (window.ACCOUNTS || []).forEach(a => { acctMap[a.uid] = a; });
+  wrap.innerHTML = breakers.map(b => {
+    const a = acctMap[b.key] || {};
+    const name = a.nickname || (b.key || '').slice(0, 10) + '...';
+    const realmBadge = a.realm === 'cn'
+      ? '<span class="badge warn" style="font-size:10px">国内版</span>'
+      : '<span class="badge s" style="font-size:10px">国际版</span>';
+    const errRate = b.error_rate != null ? (b.error_rate * 100).toFixed(1) + '%' : '—';
+    let extra = '';
+    if(b.state === 'open' && b.cooldown_remaining != null){
+      extra = '<div style="font-size:11px;color:var(--bad);margin-top:4px">冷却剩余 ' + Math.ceil(b.cooldown_remaining) + 's</div>';
+    } else if(b.state === 'half_open'){
+      extra = '<div style="font-size:11px;color:var(--warn);margin-top:4px">成功 ' + (b.consecutive_successes || 0) + ' 次后闭合</div>';
+    }
+    const failDetail = b.last_error
+      ? '<div style="font-size:11px;color:var(--dim);margin-top:4px;word-break:break-all" title="' + esc(String(b.last_error)) + '">' + esc(String(b.last_error).slice(0, 80)) + '</div>'
+      : '';
+    return '<div class="card" style="padding:10px 12px">'
+      + '<div style="display:flex;align-items:center;justify-content:space-between;gap:6px">'
+      +   '<b style="font-size:13px">' + esc(name) + ' ' + realmBadge + '</b>'
+      +   breakerStateBadge(b.state)
+      + '</div>'
+      + '<div style="font-size:11px;color:var(--dim);margin-top:4px">'
+      +   '请求 ' + fmt(b.total_requests || 0) + ' · 失败 ' + fmt(b.failed_requests || 0)
+      +   ' (' + errRate + ') · 连败 ' + (b.consecutive_failures || 0)
+      +   (b.opened_count ? ' · 曾熔断 ' + b.opened_count + ' 次' : '')
+      + '</div>'
+      + extra + failDetail
+      + '</div>';
+  }).join('');
+}
+
+async function fetchBreakers(){
+  try{
+    const r = await getJSON('/health/breakers');
+    renderBreakers(r.breakers || []);
+  }catch(e){ /* 熔断展示是只读附加能力，失败不打扰主界面 */ }
+}
+
+/* ------------------------------ 每日成本明细 ---------------------------- */
+let COST_DATA = null;
+
+function costMoney(v){
+  const n = Number(v) || 0;
+  if(n === 0) return '0';
+  if(Math.abs(n) < 0.01) return '$' + n.toFixed(4);
+  return '$' + n.toFixed(2);
+}
+
+function renderCost(){
+  const wrap = document.getElementById('costTable');
+  if(!wrap || !COST_DATA) return;
+  const days = (COST_DATA.days || []).slice().sort((x, y) => (y.date || '').localeCompare(x.date || ''));
+  const em = document.getElementById('costDayCount');
+  if(em) em.textContent = days.length ? '(' + days.length + ' 天)' : '';
+  const tot = COST_DATA.totals || {};
+  const totEl = document.getElementById('costTotals');
+  if(totEl){
+    totEl.innerHTML =
+      card('总成本', costMoney(tot.cost), tot.cost_estimated_requests ? tot.cost_estimated_requests + ' 天为兜底估价' : '按实际价目计算', 'accent2') +
+      card('总请求', fmt(tot.requests || 0) + ' 次', 'Token ' + fmt(tot.total_tokens || 0), '') +
+      card('输入 Token', fmt(tot.prompt_tokens || 0), '缓存命中 ' + fmt(tot.cached_tokens || 0), 'think');
+  }
+  const meta = COST_DATA.pricing || {};
+  const metaEl = document.getElementById('costPricingMeta');
+  if(metaEl){
+    let src = '价目来源: ' + (meta.source || 'unknown');
+    if(meta.source === 'fallback') src = '价目来源: 内置兜底价';
+    if(meta.models_covered != null) src += ' · 覆盖 ' + meta.models_covered + ' 模型';
+    metaEl.textContent = src + ' · 单位 USD';
+  }
+  if(!days.length){
+    wrap.innerHTML = '<div class="empty">暂无用量记录</div>';
+    return;
+  }
+  wrap.innerHTML = '<table><thead><tr>'
+    + '<th>日期</th><th>请求</th><th>失败</th><th>输入</th><th>输出</th><th>推理</th><th>缓存</th><th>总 Token</th><th>成本 (USD)</th>'
+    + '</tr></thead><tbody>'
+    + days.map(d => {
+        const est = d.cost_estimated
+          ? ' <span class="badge warn" style="font-size:10px" title="该日有模型未匹配到价目，按兜底价估算">估</span>'
+          : '';
+        return '<tr>'
+          + '<td class="mono">' + esc(d.date || '') + '</td>'
+          + '<td>' + fmt(d.requests || 0) + '</td>'
+          + '<td>' + (d.errors ? '<span style="color:var(--bad)">' + fmt(d.errors) + '</span>' : '0') + '</td>'
+          + '<td>' + fmt(d.prompt_tokens || 0) + '</td>'
+          + '<td>' + fmt(d.completion_tokens || 0) + '</td>'
+          + '<td>' + fmt(d.reasoning_tokens || 0) + '</td>'
+          + '<td>' + fmt(d.cached_tokens || 0) + '</td>'
+          + '<td><b>' + fmt(d.total_tokens || 0) + '</b></td>'
+          + '<td><b style="color:var(--accent2)">' + costMoney(d.cost) + '</b>' + est + '</td>'
+          + '</tr>';
+      }).join('')
+    + '</tbody></table>';
+}
+
+async function loadCost(){
+  try{
+    COST_DATA = await getJSON('/usage/cost?realm=' + encodeURIComponent(window.VIEW_REALM));
+    renderCost();
+  }catch(e){ /* 指标页附属区块，失败保持原状 */ }
+}
+
+async function refreshPricing(btn){
+  if(btn){ btn.disabled = true; btn.textContent = '刷新中...'; }
+  try{
+    const r = await postJSON('/usage/cost/refresh', {});
+    toast('价目表已更新: ' + (r.source || '?') + ' · 覆盖 ' + (r.models_covered || 0) + ' 模型');
+    await loadCost();
+  }catch(e){
+    toast('刷新价目表失败: ' + e.message, 'err');
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = '刷新价目表'; }
+  }
+}
+
+/* ------------------------------- MCP 管理 ------------------------------- */
+let MCP_DATA = null;
+let MCP_EDIT_ID = null;   // null = 新增；非空 = 编辑该 id
+const MCP_APP_NAMES = {claude: 'Claude Code', codex: 'Codex', gemini: 'Gemini CLI'};
+
+function mcpAppChip(appId, app){
+  const ok = app.synced && !app.error;
+  const dot = app.installed ? (ok ? 'var(--accent2)' : 'var(--warn)') : 'var(--dim)';
+  const state = !app.installed ? '未安装'
+    : (app.error ? ('同步出错: ' + String(app.error).slice(0, 40))
+    : (ok ? '已同步 · ' + (app.servers || []).length + ' 个' : '待同步'));
+  return '<div class="card" style="padding:10px 12px;display:flex;align-items:center;gap:8px">'
+    + '<span class="dot" style="background:' + dot + '"></span>'
+    + '<div style="flex:1;min-width:0">'
+    +   '<b style="font-size:13px">' + esc(MCP_APP_NAMES[appId] || appId) + '</b>'
+    +   '<div style="font-size:11px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">' + esc(state) + '</div>'
+    + '</div></div>';
+}
+
+function mcpCmdText(srv){
+  if(srv.url) return srv.url;
+  return [srv.command].concat(srv.args || []).filter(Boolean).join(' ');
+}
+
+function renderMcp(){
+  const wrap = document.getElementById('mcpList');
+  if(!wrap || !MCP_DATA) return;
+  const servers = MCP_DATA.servers || [];
+  const apps = MCP_DATA.apps || {};
+  const bar = document.getElementById('mcpAppsBar');
+  if(bar){
+    bar.innerHTML = Object.keys(apps).map(id => mcpAppChip(id, apps[id] || {})).join('');
+  }
+  if(!servers.length){
+    wrap.innerHTML = '<div class="empty">MCP 服务器库为空，点击右上角「新增服务器」添加</div>';
+    return;
+  }
+  wrap.innerHTML = '<table><thead><tr>'
+    + '<th>名称</th><th>命令 / URL</th><th style="width:220px">应用到客户端</th><th style="width:170px">操作</th>'
+    + '</tr></thead><tbody>'
+    + servers.map(s => {
+        const srv = s.server || {};
+        const badges = ['claude', 'codex', 'gemini'].map(appId => {
+          const on = s.apps && s.apps[appId];
+          return '<span class="badge ' + (on ? 'ok' : '') + '" style="font-size:10px;margin-right:4px">'
+            + esc(MCP_APP_NAMES[appId] || appId) + (on ? ' ✓' : '') + '</span>';
+        }).join('');
+        const envKeys = Object.keys(srv.env || {});
+        const envStr = envKeys.length ? ' <span style="color:var(--dim);font-size:11px">env: ' + esc(envKeys.join(',')) + '</span>' : '';
+        // 操作按钮通过 data-id + 事件委托回传，避免把 id 拼进内联 onclick。
+        return '<tr>'
+          + '<td style="text-align:left"><b>' + esc(s.name || s.id) + '</b>'
+          +   (s.description ? '<div style="font-size:11px;color:var(--dim)">' + esc(String(s.description).slice(0, 60)) + '</div>' : '')
+          + '</td>'
+          + '<td class="mono" style="text-align:left;max-width:340px;word-break:break-all;font-size:12px">' + esc(mcpCmdText(srv)) + envStr + '</td>'
+          + '<td>' + badges + '</td>'
+          + '<td style="white-space:nowrap">'
+          +   '<button class="sec mini" data-mcp-act="edit" data-id="' + esc(s.id) + '">编辑</button> '
+          +   '<button class="sec mini" data-mcp-act="toggle" data-id="' + esc(s.id) + '">启停</button> '
+          +   '<button class="sec mini" style="color:var(--bad)" data-mcp-act="delete" data-id="' + esc(s.id) + '">删除</button>'
+          + '</td>'
+          + '</tr>';
+      }).join('')
+    + '</tbody></table>';
+  wrap.querySelectorAll('button[data-mcp-act]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const id = btn.getAttribute('data-id');
+      const act = btn.getAttribute('data-mcp-act');
+      if(act === 'edit') openMcpUpsert(id);
+      else if(act === 'toggle') mcpToggle(id);
+      else if(act === 'delete') mcpDelete(id);
+    });
+  });
+}
+
+async function loadMcp(){
+  try{
+    MCP_DATA = await getJSON('/mcp');
+    renderMcp();
+  }catch(e){ /* getJSON 已处理 401 登录门 */ }
+}
+
+async function mcpSync(btn){
+  if(btn){ btn.disabled = true; btn.textContent = '同步中...'; }
+  try{
+    await postJSON('/mcp/sync', {});
+    toast('已同步到客户端，详见上方各客户端状态');
+    await loadMcp();
+  }catch(e){
+    toast('同步失败: ' + e.message, 'err');
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = '同步到客户端'; }
+  }
+}
+
+async function mcpToggle(id){
+  const rec = (MCP_DATA.servers || []).find(s => s.id === id);
+  if(!rec) return;
+  const apps = rec.apps || {};
+  const allOn = ['claude', 'codex', 'gemini'].every(a => apps[a]);
+  const next = !allOn;   // 全开→全关；部分关→全开
+  try{
+    for(const appId of ['claude', 'codex', 'gemini']){
+      await postJSON('/mcp/set', {id: id, app: appId, enabled: next});
+    }
+    toast('已' + (next ? '启用' : '停用') + '到全部客户端');
+    await loadMcp();
+  }catch(e){
+    toast('操作失败: ' + e.message, 'err');
+  }
+}
+
+async function mcpDelete(id){
+  const rec = (MCP_DATA.servers || []).find(s => s.id === id);
+  if(!confirm('删除 MCP 服务器「' + ((rec && rec.name) || id) + '」？该操作同时会从客户端配置里移除。')) return;
+  try{
+    await postJSON('/mcp/delete', {id: id});
+    toast('已删除');
+    await loadMcp();
+  }catch(e){
+    toast('删除失败: ' + e.message, 'err');
+  }
+}
+
+function openMcpUpsert(id){
+  MCP_EDIT_ID = id || null;
+  const modal = document.getElementById('mcpUpsertModal');
+  if(!modal) return;
+  const rec = id ? (MCP_DATA.servers || []).find(s => s.id === id) : null;
+  const srv = (rec && rec.server) || {};
+  document.getElementById('mcpUpsertTitle').textContent = id ? '编辑 MCP 服务器' : '新增 MCP 服务器';
+  document.getElementById('mcpFName').value = (rec && rec.name) || '';
+  document.getElementById('mcpFDesc').value = (rec && rec.description) || '';
+  const isHttp = !!srv.url;
+  document.getElementById('mcpFType').value = isHttp ? 'http' : 'stdio';
+  document.getElementById('mcpFUrl').value = srv.url || '';
+  document.getElementById('mcpFCmd').value = srv.command || '';
+  document.getElementById('mcpFArgs').value = (srv.args || []).join('\n');
+  document.getElementById('mcpFEnv').value = Object.entries(srv.env || {})
+    .map(([k, v]) => k + '=' + v).join('\n');
+  document.getElementById('mcpUpsertMsg').textContent = '';
+  mcpTypeChanged();
+  modal.classList.add('show');
+}
+
+function closeMcpUpsert(){
+  const m = document.getElementById('mcpUpsertModal');
+  if(m) m.classList.remove('show');
+}
+
+function mcpTypeChanged(){
+  const isHttp = document.getElementById('mcpFType').value === 'http';
+  document.getElementById('mcpCmdRow').style.display = isHttp ? 'none' : '';
+  document.getElementById('mcpArgsRow').style.display = isHttp ? 'none' : '';
+  document.getElementById('mcpUrlRow').style.display = isHttp ? '' : 'none';
+}
+
+async function submitMcpUpsert(){
+  const msg = document.getElementById('mcpUpsertMsg');
+  const name = document.getElementById('mcpFName').value.trim();
+  const isHttp = document.getElementById('mcpFType').value === 'http';
+  const url = document.getElementById('mcpFUrl').value.trim();
+  const cmd = document.getElementById('mcpFCmd').value.trim();
+  if(!name){ msg.textContent = '请填写名称'; return; }
+  if(isHttp && !url){ msg.textContent = '请填写 URL'; return; }
+  if(!isHttp && !cmd){ msg.textContent = '请填写命令'; return; }
+  const args = document.getElementById('mcpFArgs').value.split('\n').map(s => s.trim()).filter(Boolean);
+  const env = {};
+  document.getElementById('mcpFEnv').value.split('\n').forEach(line => {
+    const i = line.indexOf('=');
+    if(i > 0) env[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+  });
+  // 编辑时保留原 id 与启用状态；新增时由前端生成短 id（后端要求顶层 id）。
+  const sid = MCP_EDIT_ID
+    || ('mcp-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6));
+  let keepApps = {};
+  if(MCP_EDIT_ID){
+    const old = (MCP_DATA.servers || []).find(s => s.id === MCP_EDIT_ID);
+    if(old) keepApps = old.apps || {};
+  }
+  const payload = {
+    id: sid,
+    name: name,
+    description: document.getElementById('mcpFDesc').value.trim(),
+    apps: keepApps,
+    server: isHttp
+      ? {type: 'http', url: url}
+      : {type: 'stdio', command: cmd, args: args, env: env},
+  };
+  try{
+    await postJSON('/mcp/upsert', payload);
+    toast(MCP_EDIT_ID ? '已保存' : '已添加');
+    closeMcpUpsert();
+    await loadMcp();
+  }catch(e){
+    msg.textContent = '保存失败: ' + e.message;
+  }
+}
+
+/* ------------------------------- 会话管理 ------------------------------- */
+let SESS_PROVIDER = 'claude';
+let SESS_ALL = [];         // /sessions 一次返回三家，前端按 provider_id 过滤
+let SESS_CURRENT = null;   // 正在查看消息的会话
+
+function setSessionProvider(p){
+  SESS_PROVIDER = p;
+  ['claude', 'codex', 'gemini'].forEach(x => {
+    const btn = document.getElementById('btnSessProv' + x.charAt(0).toUpperCase() + x.slice(1));
+    if(btn) btn.classList.toggle('active', x === p);
+  });
+  renderSessions();
+}
+
+function sessFmtTime(ts){
+  if(!ts) return '—';
+  const d = new Date(ts * 1000);
+  if(isNaN(d.getTime())) return esc(String(ts));
+  const pad = n => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate())
+    + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+}
+
+async function loadSessions(){
+  try{
+    const r = await getJSON('/sessions');
+    SESS_ALL = r.sessions || [];
+    renderSessions();
+  }catch(e){ /* getJSON 已处理 401 登录门 */ }
+}
+
+function renderSessions(){
+  const wrap = document.getElementById('sessionsList');
+  if(!wrap) return;
+  // /sessions 不支持服务端 provider 过滤，这里在客户端完成。
+  const rows = SESS_ALL.filter(s => (s.provider_id || '') === SESS_PROVIDER);
+  if(!rows.length){
+    wrap.innerHTML = '<div class="empty">未发现 ' + esc(MCP_APP_NAMES[SESS_PROVIDER] || SESS_PROVIDER)
+      + ' 会话记录' + (SESS_ALL.length ? '（其它客户端共 ' + SESS_ALL.length + ' 条）' : '') + '</div>';
+    return;
+  }
+  wrap.innerHTML = '<table><thead><tr>'
+    + '<th>标题</th><th>项目目录</th><th>创建</th><th>最近活跃</th><th style="width:220px">操作</th>'
+    + '</tr></thead><tbody>'
+    + rows.map((s, i) => {
+        // 行号 i 作索引回传，路径/命令等含反斜杠与引号的内容不进 HTML 属性。
+        return '<tr>'
+          + '<td style="text-align:left;max-width:320px"><b>' + esc(s.title || s.session_id || '(无标题)') + '</b>'
+          +   '<div style="font-size:11px;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'
+          +     esc(String(s.summary || '').slice(0, 60)) + '</div></td>'
+          + '<td class="mono" style="text-align:left;max-width:220px;font-size:11px;word-break:break-all">' + esc(s.project_dir || '') + '</td>'
+          + '<td style="white-space:nowrap">' + sessFmtTime(s.created_at) + '</td>'
+          + '<td style="white-space:nowrap">' + sessFmtTime(s.last_active_at) + '</td>'
+          + '<td style="white-space:nowrap">'
+          +   '<button class="sec mini" data-sess-act="msg" data-i="' + i + '">消息</button> '
+          +   '<button class="sec mini" data-sess-act="resume" data-i="' + i + '">复制命令</button> '
+          +   '<button class="sec mini" style="color:var(--bad)" data-sess-act="delete" data-i="' + i + '">删除</button>'
+          + '</td>'
+          + '</tr>';
+      }).join('')
+    + '</tbody></table>';
+  wrap.querySelectorAll('button[data-sess-act]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const idx = parseInt(btn.getAttribute('data-i'), 10);
+      const rec = SESS_ALL.filter(s => (s.provider_id || '') === SESS_PROVIDER)[idx];
+      if(!rec) return;
+      const act = btn.getAttribute('data-sess-act');
+      if(act === 'msg') openSessionMsg(rec);
+      else if(act === 'resume') copySessionResume(rec);
+      else if(act === 'delete') deleteSession(rec);
+    });
+  });
+}
+
+async function openSessionMsg(rec){
+  const modal = document.getElementById('sessionMsgModal');
+  if(!modal) return;
+  SESS_CURRENT = rec;
+  document.getElementById('sessionMsgTitle').textContent =
+    rec.title || rec.session_id || '会话消息';
+  document.getElementById('sessionMsgMeta').textContent =
+    (MCP_APP_NAMES[rec.provider_id] || rec.provider_id || '') + ' · '
+    + sessFmtTime(rec.last_active_at) + ' · ' + (rec.project_dir || '');
+  document.getElementById('sessionMsgBody').innerHTML = '<div class="empty">加载中...</div>';
+  modal.classList.add('show');
+  try{
+    const r = await getJSON('/sessions/messages?provider=' + encodeURIComponent(rec.provider_id || SESS_PROVIDER)
+      + '&path=' + encodeURIComponent(rec.source_path || ''));
+    const msgs = r.messages || [];
+    if(!msgs.length){
+      document.getElementById('sessionMsgBody').innerHTML = '<div class="empty">该会话没有可显示的消息</div>';
+      return;
+    }
+    document.getElementById('sessionMsgBody').innerHTML = msgs.map(m => {
+      const roleNames = {user: '用户', assistant: '助手', tool: '工具', system: '系统'};
+      const roleCls = m.role === 'user' ? 'accent' : (m.role === 'tool' ? 'think' : '');
+      const txt = String(m.content || '');
+      return '<div class="card" style="padding:10px 12px;margin-bottom:8px">'
+        + '<div style="font-size:11px;color:var(--dim);margin-bottom:4px">'
+        +   '<span class="badge ' + roleCls + '" style="font-size:10px">' + esc(roleNames[m.role] || m.role) + '</span>'
+        +   (m.ts ? ' ' + sessFmtTime(m.ts) : '')
+        + '</div>'
+        + '<div style="font-size:12px;white-space:pre-wrap;word-break:break-word;max-height:200px;overflow-y:auto">'
+        +   esc(txt.length > 4000 ? txt.slice(0, 4000) + '\n...(已截断)' : txt)
+        + '</div></div>';
+    }).join('');
+  }catch(e){
+    document.getElementById('sessionMsgBody').innerHTML = '<div class="empty">加载失败: ' + esc(e.message) + '</div>';
+  }
+}
+
+function closeSessionMsg(){
+  const m = document.getElementById('sessionMsgModal');
+  if(m) m.classList.remove('show');
+}
+
+async function copySessionResume(rec){
+  if(!rec || !rec.resume_command){ toast('该会话没有恢复命令', 'err'); return; }
+  try{
+    await writeClipboard(rec.resume_command);
+    toast('恢复命令已复制');
+  }catch(e){
+    toast('复制失败: ' + e.message, 'err');
+  }
+}
+
+async function deleteSession(rec){
+  if(!confirm('删除会话「' + (rec.title || (rec.session_id || '').slice(0, 12)) + '」？该操作会删除磁盘上的会话文件，不可恢复。')) return;
+  try{
+    await postJSON('/sessions/delete', {
+      provider: rec.provider_id || SESS_PROVIDER,
+      session_id: rec.session_id,
+      source_path: rec.source_path,
+    });
+    toast('会话已删除');
+    await loadSessions();
+  }catch(e){
+    toast('删除失败: ' + e.message, 'err');
   }
 }
 </script>
