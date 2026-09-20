@@ -5,15 +5,22 @@
 从网上拉取：
 
 * 主源：LiteLLM 官方价目 JSON（model_prices_and_context_window.json，
-  4000+ 模型、社区维护、更新勤）；
+  4000+ 模型、社区维护、更新勤）。国内直连 raw.githubusercontent 常常
+  不通，因此按实测延迟依次尝试一组镜像（jsDelivr 各边缘节点 → 官方
+  raw → ghproxy 中转），并遵循与 wb_update.py 相同的 ``WB_UPDATE_PROXY``
+  代理约定；
 * 副源：OpenRouter /api/v1/models（pricing.prompt / pricing.completion，
   单位是 USD/token 字符串）；
 * 兜底：随包内嵌一份生成时抓取的快照（EMBEDDED_PRICES），断网也能算；
 * 最后防线：未知模型按兜底价计（FALLBACK_PRICE），并在响应里标记
   ``estimated=true``。
 
-拉取结果写到数据目录 ``usage/prices-cache.json``，带 TTL（默认 24h）；
-每次刷新只做一次网络请求、失败静默回退缓存/快照，绝不影响请求路径。
+拉取结果写到数据目录 ``usage/prices-cache.json``，带 TTL（默认 24h）。
+
+联网绝不占用请求线程：get_table() 只读内存 / 缓存文件 / 内嵌快照，
+远程刷新由守护线程在后台完成（成功后至多每 CACHE_TTL 一次，失败按
+RETRY_INTERVAL 退避重试）；只有面板「刷新价目表」按钮走同步拉取，
+且同样在模块锁之外进行，不阻塞其它请求。
 
 计价语义（与 LiteLLM 一致，单位 USD/token）：
 
@@ -102,8 +109,36 @@ FALLBACK_PRICE = {"input": 1e-06, "output": 3e-06, "cache_read": 1e-07}
 #: 缓存有效期（秒）。价目变化不频繁，一天刷一次足够。
 CACHE_TTL = 86400.0
 
-LITELLM_URL = ("https://raw.githubusercontent.com/BerriAI/litellm/main/"
-               "model_prices_and_context_window.json")
+#: 远程拉取失败后的重试间隔（秒）。避免断网主机每个请求都撞一次超时。
+RETRY_INTERVAL = 1800.0
+
+#: 远程拉取的超时（秒）。镜像链会逐个尝试，单源不宜拖太久。
+FETCH_TIMEOUT = 10
+
+#: 可选代理，与 wb_update.py 同一约定（``WB_UPDATE_PROXY``），例如
+#: "http://127.0.0.1:7890"。GitHub 直连在国内网络经常不通。
+PROXY_ENV = "WB_UPDATE_PROXY"
+
+#: LiteLLM 价目 JSON 的拉取源，按实测延迟排序。前四个是 jsDelivr 的
+#: 多家边缘节点（国内可达、免 KEY），然后是官方 raw（有代理时最快），
+#: 最后是 ghproxy 中转。内容完全一致，只是传输路径不同。
+LITELLM_MIRRORS = (
+    "https://gcore.jsdelivr.net/gh/BerriAI/litellm@main/"
+    "model_prices_and_context_window.json",
+    "https://testingcf.jsdelivr.net/gh/BerriAI/litellm@main/"
+    "model_prices_and_context_window.json",
+    "https://fastly.jsdelivr.net/gh/BerriAI/litellm@main/"
+    "model_prices_and_context_window.json",
+    "https://cdn.jsdelivr.net/gh/BerriAI/litellm@main/"
+    "model_prices_and_context_window.json",
+    "https://raw.githubusercontent.com/BerriAI/litellm/main/"
+    "model_prices_and_context_window.json",
+    "https://ghproxy.net/https://raw.githubusercontent.com/BerriAI/litellm/"
+    "main/model_prices_and_context_window.json",
+)
+
+#: 兼容旧名：测试与调用方引用的主源。
+LITELLM_URL = LITELLM_MIRRORS[0]
 OPENROUTER_URL = "https://openrouter.ai/api/v1/models"
 
 _lock = threading.Lock()
@@ -112,6 +147,8 @@ _state = {
     "source": None,       # "embedded" | "cache" | "litellm" | "openrouter"
     "fetched_at": 0.0,    # epoch of last successful remote pull
     "cache_path": None,
+    "last_attempt": 0.0,  # epoch of last remote refresh attempt (any outcome)
+    "refreshing": False,  # a background refresh is in flight
 }
 
 
@@ -247,10 +284,37 @@ def _parse_embedded(snapshot):
 
 
 # ---------------------------------------------------------------- fetch
-def _fetch_json(url, timeout=15):
+def _opener():
+    """urlopen wrapper honouring the optional ``WB_UPDATE_PROXY`` setting
+    (same convention as wb_update.py; GitHub direct is often unreachable
+    from mainland networks)."""
+    proxy = (os.environ.get(PROXY_ENV) or "").strip()
+    if not proxy:
+        return urllib.request.urlopen
+    handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+    return urllib.request.build_opener(handler).open
+
+
+def _fetch_json(url, timeout=FETCH_TIMEOUT):
     req = urllib.request.Request(url, headers={"User-Agent": "WorkBuddy2API/1.7"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with _opener()(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+def _fetch_litellm():
+    """Try the LiteLLM price JSON across the mirror chain, in order.
+
+    Returns (parsed, mirror_url); raises when every mirror fails. Mirrors
+    serve the identical file, so the first success wins — later entries
+    only matter when an edge node is blocked or stale.
+    """
+    last_exc = None
+    for url in LITELLM_MIRRORS:
+        try:
+            return _fetch_json(url), url
+        except Exception as exc:            # noqa: BLE001 - mirror hop
+            last_exc = exc
+    raise last_exc if last_exc else IOError("no mirrors configured")
 
 
 def _load_cache(path):
@@ -285,47 +349,11 @@ def _save_cache(path, table):
         pass
 
 
-def _refresh_locked(force=False):
-    """Build the live PriceTable: remote -> cache -> embedded."""
-    path = _state["cache_path"]
-    now = time.time()
-
-    def too_stale():
-        return force or (_state["prices"] is None) or \
-            (now - _state["fetched_at"] > CACHE_TTL)
-
-    if not too_stale():
+def _resolve_local_locked():
+    """In-memory table -> cache file -> embedded snapshot. No network."""
+    if _state["prices"] is not None:
         return _state["prices"]
-
-    # 1) remote LiteLLM
-    try:
-        table = PriceTable(_parse_litellm(_fetch_json(LITELLM_URL)),
-                           "litellm", now)
-        if len(table.prices) >= 100:
-            _state["prices"] = table
-            _state["source"] = table.source
-            _state["fetched_at"] = now
-            if path:
-                _save_cache(path, table)
-            return table
-    except Exception:
-        pass
-
-    # 2) OpenRouter as a lighter secondary
-    try:
-        table = PriceTable(_parse_openrouter(_fetch_json(OPENROUTER_URL)),
-                           "openrouter", now)
-        if len(table.prices) >= 50:
-            _state["prices"] = table
-            _state["source"] = table.source
-            _state["fetched_at"] = now
-            if path:
-                _save_cache(path, table)
-            return table
-    except Exception:
-        pass
-
-    # 3) cache (even if expired — stale beats embedded)
+    path = _state["cache_path"]
     if path:
         cached = _load_cache(path)
         if cached:
@@ -333,27 +361,112 @@ def _refresh_locked(force=False):
             _state["source"] = cached.source
             _state["fetched_at"] = cached.fetched_at
             return cached
-
-    # 4) embedded snapshot (fetched_at=now so offline hosts don't re-hit the
-    #    network on every call; remote retry happens after CACHE_TTL)
+    # fetched_at=0 marks "never fetched remotely": the background scheduler
+    # sees it as immediately due, without blocking this call.
     embedded = PriceTable(_parse_embedded(EMBEDDED_PRICES), "embedded", 0.0)
     _state["prices"] = embedded
     _state["source"] = "embedded"
-    _state["fetched_at"] = now
     return embedded
 
 
-def get_table(cache_path=None, force_refresh=False):
-    """Public accessor. ``cache_path`` persists remote pulls.
+def _refresh_remote(force=False):
+    """Synchronous remote pull (LiteLLM mirrors -> OpenRouter).
 
-    Thread-safe; remote fetch happens at most once per CACHE_TTL unless
-    ``force_refresh`` (used by the panel's refresh button).
+    Runs OUTSIDE the module lock so the network can never stall other
+    threads. Returns the new PriceTable, or None when every source was
+    unreachable (the local table stays in place). Raises only when
+    ``force`` is set and nothing was reachable — the panel's refresh
+    button wants that surfaced as an error, not silently stale data.
+    """
+    now = time.time()
+    table = None
+    # 1) LiteLLM across the mirror chain
+    try:
+        data, _mirror = _fetch_litellm()
+        parsed = _parse_litellm(data)
+        if len(parsed) >= 100:
+            table = PriceTable(parsed, "litellm", now)
+    except Exception:
+        table = None
+
+    # 2) OpenRouter as a lighter secondary
+    if table is None:
+        try:
+            parsed = _parse_openrouter(_fetch_json(OPENROUTER_URL))
+            if len(parsed) >= 50:
+                table = PriceTable(parsed, "openrouter", now)
+        except Exception:
+            table = None
+
+    with _lock:
+        _state["last_attempt"] = time.time()
+        path = None
+        if table is not None:
+            _state["prices"] = table
+            _state["source"] = table.source
+            _state["fetched_at"] = now
+            path = _state["cache_path"]
+    if table is not None and path:
+        _save_cache(path, table)
+    if table is None and force:
+        raise IOError("价目表远程源全部不可达（国内网络可设置 "
+                      "WB_UPDATE_PROXY=http://代理地址 后重试）")
+    return table
+
+
+def _refresh_worker():
+    try:
+        _refresh_remote()
+    except Exception:
+        pass
+    finally:
+        with _lock:
+            _state["refreshing"] = False
+
+
+def _refresh_async():
+    """Kick a background refresh when the table is stale and none runs.
+
+    Backs off for RETRY_INTERVAL after any attempt so an offline host does
+    not spawn a thread on every request.
+    """
+    with _lock:
+        now = time.time()
+        if _state["refreshing"]:
+            return
+        if _state["last_attempt"] and now - _state["last_attempt"] < RETRY_INTERVAL:
+            return
+        if _state["prices"] is not None and _state["fetched_at"] > 0 and \
+                now - _state["fetched_at"] <= CACHE_TTL:
+            return
+        _state["refreshing"] = True
+        _state["last_attempt"] = now
+    threading.Thread(target=_refresh_worker,
+                     name="wb-pricing-refresh", daemon=True).start()
+
+
+def get_table(cache_path=None, force_refresh=False):
+    """Public accessor. Resolves instantly from memory / cache file /
+    embedded snapshot and NEVER blocks the calling thread on the network.
+
+    ``cache_path`` persists remote pulls. A stale or missing table triggers
+    a single background refresh (daemon thread; at most one in flight,
+    retried at most once per RETRY_INTERVAL while unreachable).
+    ``force_refresh`` — the panel's refresh button — pulls synchronously
+    but still outside the module lock, and raises when every remote source
+    is unreachable.
     """
     with _lock:
         if cache_path and _state["cache_path"] != cache_path:
             _state["cache_path"] = cache_path
-            _state["fetched_at"] = 0.0     # new file: try (re)binding
-        return _refresh_locked(force=force_refresh)
+            _state["prices"] = None        # rebind: re-read the file
+            _state["fetched_at"] = 0.0
+            _state["last_attempt"] = 0.0
+        table = _resolve_local_locked()
+    if force_refresh:
+        return _refresh_remote(force=True)
+    _refresh_async()
+    return table
 
 
 def _reset():
@@ -363,6 +476,8 @@ def _reset():
         _state["source"] = None
         _state["fetched_at"] = 0.0
         _state["cache_path"] = None
+        _state["last_attempt"] = 0.0
+        _state["refreshing"] = False
 
 
 # ---------------------------------------------------------------- costing
