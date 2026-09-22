@@ -2633,7 +2633,14 @@ class MainWindow(QMainWindow):
         ordered = sorted(by_model.items(),
                          key=lambda kv: -(kv[1].get("total_tokens") or 0))
         table = self.model_table
-        table.setRowCount(len(ordered))
+        # Incremental update: reuse existing rows, avoid setRowCount() which
+        # destroys all cells and forces ResizeToContents re-computation on every
+        # refresh (every 5 s), causing O(n×cols) column-width recalculation.
+        current_rows = table.rowCount()
+        for row in range(current_rows, len(ordered)):
+            table.insertRow(row)
+        for row in range(len(ordered), current_rows):
+            table.removeRow(row)
         for row, (model, bucket) in enumerate(ordered):
             values = [model,
                       self._num(bucket.get("requests")),
@@ -2642,12 +2649,16 @@ class MainWindow(QMainWindow):
                       self._num(bucket.get("reasoning_tokens")),
                       self._num(bucket.get("total_tokens"))]
             for column, text in enumerate(values):
-                item = QTableWidgetItem(text)
+                item = table.item(row, column)
+                if item is None:
+                    item = QTableWidgetItem(text)
+                    table.setItem(row, column, item)
+                else:
+                    item.setText(text)
                 if column == 4:
                     item.setForeground(QColor(theme.THINK))
                 elif column == 5:
                     item.setForeground(QColor(theme.ACCENT))
-                table.setItem(row, column, item)
 
         self.usage_hint.setText(
             "以上为 %s 的累计用量，数据来自 usage.jsonl，重启不丢。"
@@ -2660,7 +2671,12 @@ class MainWindow(QMainWindow):
         except Exception:
             recent = []
         rtable = self.recent_table
-        rtable.setRowCount(len(recent))
+        # Incremental update: avoid setRowCount() destroy/rebuild cycle.
+        current_rrows = rtable.rowCount()
+        for row in range(current_rrows, len(recent)):
+            rtable.insertRow(row)
+        for row in range(len(recent), current_rrows):
+            rtable.removeRow(row)
         for row_index, entry in enumerate(reversed(recent)):
             stamp = (entry.get("iso") or "").replace("T", " ")[5:]
             is_error = bool(entry.get("error"))
@@ -2678,12 +2694,16 @@ class MainWindow(QMainWindow):
                 self._num(entry.get("total_tokens")),
             ]
             for column, text in enumerate(values):
-                item = QTableWidgetItem(text)
+                item = rtable.item(row_index, column)
+                if item is None:
+                    item = QTableWidgetItem(text)
+                    rtable.setItem(row_index, column, item)
+                else:
+                    item.setText(text)
                 if is_error:
                     item.setForeground(QColor(theme.DANGER))
                 elif column == 3:
                     item.setForeground(QColor(theme.SUCCESS))
-                rtable.setItem(row_index, column, item)
 
     #: Most log lines rendered in one tick. Each line becomes an HTML block,
     #: so a large batch is what made switching to the Logs tab stutter; the

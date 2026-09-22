@@ -301,8 +301,10 @@ def do_cat_travel(account):
 
     state = st.get("state")
     if state == "arrived":
-        # 领奖
-        req_cl = urllib.request.Request(CHAT_BASE + "/activity/growth/buddy/travel/claim", data=b"", method="POST", headers=headers)
+        # 领奖（body 须为 {} 或空 JSON 对象）
+        cl_headers = dict(headers)
+        cl_headers["Content-Type"] = "application/json"
+        req_cl = urllib.request.Request(CHAT_BASE + "/activity/growth/buddy/travel/claim", data=b"{}", method="POST", headers=cl_headers)
         try:
             with urllib.request.urlopen(req_cl, timeout=10) as resp:
                 c_res = json.loads(resp.read().decode("utf-8"))
@@ -315,8 +317,10 @@ def do_cat_travel(account):
     if state == "idle":
         if st.get("daily_limit_reached"):
             return {"ok": True, "action": "idle", "msg": "猫猫今日已完成旅行，明日 00:00 刷新"}
-        # 派出旅行
-        req_dep = urllib.request.Request(CHAT_BASE + "/activity/growth/buddy/travel/depart", data=b"", method="POST", headers=headers)
+        # 派出旅行（body 须为 {} 或空 JSON 对象，否则部分服务器返回 400）
+        dep_headers = dict(headers)
+        dep_headers["Content-Type"] = "application/json"
+        req_dep = urllib.request.Request(CHAT_BASE + "/activity/growth/buddy/travel/depart", data=b"{}", method="POST", headers=dep_headers)
         try:
             with urllib.request.urlopen(req_dep, timeout=10) as resp:
                 dep_res = json.loads(resp.read().decode("utf-8"))
