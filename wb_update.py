@@ -142,8 +142,8 @@ def _release_assets(repo, tag, timeout=CONNECT_TIMEOUT):
     failing outright.
     """
     guesses = [
-        "https://github.com/%s/releases/download/%s/WorkBuddy2API-%s-win64.zip"
-        % (repo, tag, tag),
+        "https://github.com/%s/releases/download/%s/WorkBuddy2API.exe"
+        % (repo, tag),
     ]
     try:
         url = _checked("https://github.com/%s/releases/expanded_assets/%s"
@@ -153,7 +153,7 @@ def _release_assets(repo, tag, timeout=CONNECT_TIMEOUT):
         with _opener()(request, timeout=timeout) as resp:
             html = resp.read().decode("utf-8", "replace")
         found = re.findall(
-            r'href="(/[^"]+/releases/download/[^"]+\.zip)"', html)
+            r'href="(/[^"]+/releases/download/[^"]+\.(?:exe|zip))"', html)
         ordered = []
         for href in found:
             full = "https://github.com" + href
