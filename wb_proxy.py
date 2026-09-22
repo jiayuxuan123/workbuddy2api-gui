@@ -978,7 +978,7 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "1.2.0",
+        "version": APP_VERSION,
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -2768,7 +2768,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/1.2.0"
+    server_version = "wb-proxy/" + APP_VERSION
     def log_message(self, fmt, *args):
         log(fmt % args)
     def _json(self, code, obj):
