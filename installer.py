@@ -773,13 +773,85 @@ def payload_version(archive):
     return ""
 
 
+def _aside_name(dest):
+    """A free ``<dest>.old`` style name to park a locked file under."""
+    base = dest + ".old"
+    if not os.path.exists(base):
+        return base
+    # 上一轮留下的 .old 还在（多半是那个进程仍在跑）。先试删，再退到编号名。
+    try:
+        os.remove(base)
+        return base
+    except OSError:
+        pass
+    for index in range(1, 100):
+        candidate = "%s.old%d" % (dest, index)
+        if not os.path.exists(candidate):
+            return candidate
+    raise InstallError("无法为被占用的文件腾出名字：%s" % dest)
+
+
+def _write_member(zf, member, target):
+    """Extract one member, stepping around a file that is currently in use.
+
+    A running program holds its own image open **without** ``FILE_SHARE_WRITE``,
+    so overwriting it fails with ``ERROR_SHARING_VIOLATION`` (32) - which is
+    exactly what an in-place upgrade of a running install hits. Windows does
+    still allow the *name* to be moved, so the locked file is renamed aside and
+    the new one takes its place; the old bytes vanish once the process exits,
+    and :func:`clean_leftovers` sweeps them on the next run.
+
+    Returns the aside path when one was created, else ``None``.
+    """
+    try:
+        zf.extract(member, target)
+        return None
+    except PermissionError:
+        original = sys.exc_info()[1]
+
+    dest = os.path.join(target, member.filename.replace("/", os.sep))
+    if not os.path.exists(dest):
+        # 不是"文件被占用"，而是别处的权限问题，原样抛出。
+        raise original
+    aside = _aside_name(dest)
+    try:
+        os.replace(dest, aside)
+    except OSError:
+        raise original
+    zf.extract(member, target)
+    return aside
+
+
+def clean_leftovers(target):
+    """Delete ``*.old`` files parked by :func:`_write_member`.
+
+    Best effort: a leftover whose process is still running cannot be removed
+    yet, and leaving it costs nothing beyond the disk space.
+    """
+    removed = 0
+    for root, _dirs, files in os.walk(target):
+        for name in files:
+            if ".old" not in name:
+                continue
+            path = os.path.join(root, name)
+            try:
+                os.remove(path)
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
 def extract_payload(archive, target, progress=None):
     """Unpack the program files into ``target``.
 
     ``progress`` is called with (done, total, name) so the caller can show a
-    progress bar. Extraction is done member-by-member so the bar moves.
+    progress bar. Extraction is done member-by-member so the bar moves, and a
+    member whose destination is in use is parked rather than aborting the
+    install (see :func:`_write_member`).
     """
     os.makedirs(target, exist_ok=True)
+    parked = []
     with zipfile.ZipFile(archive) as zf:
         members = [m for m in zf.infolist() if not m.is_dir()]
         total = len(members)
@@ -788,10 +860,12 @@ def extract_payload(archive, target, progress=None):
                 if progress:
                     progress(index, total, member.filename)
                 continue
-            zf.extract(member, target)
+            aside = _write_member(zf, member, target)
+            if aside:
+                parked.append(aside)
             if progress:
                 progress(index, total, member.filename)
-    return total
+    return total, parked
 
 
 def installed_size_kb(path):
@@ -839,8 +913,19 @@ def do_install(archive, install_dir, version, all_users,
     log("安装位置：%s" % install_dir)
 
     log("正在解包程序文件 ...")
-    count = extract_payload(archive, install_dir, progress)
+    count, parked = extract_payload(archive, install_dir, progress)
     log("已写入 %d 个文件" % count)
+    if parked:
+        # 旧实例还在跑：新文件已经就位，但旧镜像要到它退出后才消失。
+        # 绝不能在这里结束那个进程 —— 它可能正在给别的客户端服务。
+        log("有 %d 个文件正被运行中的实例占用，已挪到一边："
+            "该实例退出后会自动消失。" % len(parked))
+        for path in parked:
+            log("    %s" % os.path.basename(path))
+    # 顺手清掉上一轮遗留的 .old（那个进程可能已经退出了）。
+    swept = clean_leftovers(install_dir)
+    if swept:
+        log("已清理 %d 个上次更新遗留的旧文件" % swept)
 
     exe = os.path.join(install_dir, APP_EXE)
     if not os.path.exists(exe):

@@ -67,15 +67,77 @@ def minimal_pe():
     return bytes(dos) + b"PE\x00\x00" + coff + bytes(opt)
 
 
-def make_payload(dst, version="9.9.9"):
-    """A minimal but realistic payload: exe + _internal/ + payload.json."""
+def make_payload(dst, version="9.9.9", overlay=None):
+    """A minimal but realistic payload: exe + _internal/ + payload.json.
+
+    ``overlay`` appends bytes after the PE headers, the way a real build's
+    resources do. Tests that need two *distinguishable* builds pass different
+    overlays so "the new file really landed" can be asserted by content rather
+    than by mtime.
+    """
+    exe = minimal_pe()
+    if overlay:
+        exe += overlay
     with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("payload.json", json.dumps({"version": version}))
-        z.writestr("WorkBuddy2API.exe", minimal_pe())
+        z.writestr("WorkBuddy2API.exe", exe)
         z.writestr("_internal/base_library.zip", b"PK" + b"\x00" * 256)
         z.writestr("_internal/platforms/qwindows.dll", b"dll" + b"\x00" * 64)
         z.writestr("README.md", "# WorkBuddy2API\n")
     return version
+
+
+def _hold_exclusive(path):
+    """Open ``path`` the way Windows holds a running program's own image.
+
+    Measured against a real running process rather than guessed
+    (``_probe_share_mode.py``):
+
+    ==================  =========  ========  ========
+    holder              write-open rename   delete
+    ==================  =========  ========  ========
+    running image       denied(32)  allowed   denied(5)
+    ``dwShareMode=0``   denied(32)  denied    denied
+    ``share=READ|DEL``  denied(32)  allowed   allowed
+    ==================  =========  ========  ========
+
+    So ``FILE_SHARE_READ | FILE_SHARE_DELETE`` is the mode that reproduces the
+    two behaviours this fix depends on: a write is refused, a rename is
+    permitted. ``dwShareMode=0`` would be *stricter* than reality and would
+    reject the very operation the installer performs, making the test assert a
+    constraint the real system does not impose.
+    """
+    import ctypes
+    k32 = ctypes.windll.kernel32
+    k32.CreateFileW.restype = ctypes.c_void_p
+    share = 0x1 | 0x4   # FILE_SHARE_READ | FILE_SHARE_DELETE
+    handle = k32.CreateFileW(str(path), 0x80000000, share, None, 3, 0x80, None)
+    if handle in (None, ctypes.c_void_p(-1).value):
+        raise OSError("CreateFileW failed: %d" % k32.GetLastError())
+    return handle
+
+
+def _hold_no_delete(path):
+    """Open ``path`` so that it cannot be deleted, but *can* be renamed.
+
+    A running program's image behaves exactly like this: deleting it fails with
+    ``ERROR_ACCESS_DENIED`` (5) while a rename succeeds - that asymmetry is why
+    the installer parks the locked file instead of removing it. ``FILE_SHARE_READ``
+    without ``FILE_SHARE_DELETE`` reproduces it, which lets the test cover the
+    "leftover cannot be swept yet" path without spawning a process.
+    """
+    import ctypes
+    k32 = ctypes.windll.kernel32
+    k32.CreateFileW.restype = ctypes.c_void_p
+    handle = k32.CreateFileW(str(path), 0x80000000, 0x1, None, 3, 0x80, None)
+    if handle in (None, ctypes.c_void_p(-1).value):
+        raise OSError("CreateFileW failed: %d" % k32.GetLastError())
+    return handle
+
+
+def _release(handle):
+    import ctypes
+    ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(handle))
 
 
 def report():
@@ -103,9 +165,10 @@ def main():
               repr(inst.payload_version(payload)))
 
         seen = []
-        count = inst.extract_payload(
+        count, parked = inst.extract_payload(
             payload, target, progress=lambda d, t, n: seen.append((d, t, n)))
         check("解包返回成员数", count >= 5, str(count))
+        check("全新安装没有需要挪开的文件", parked == [], repr(parked))
         check("WorkBuddy2API.exe 已就位",
               os.path.exists(os.path.join(target, "WorkBuddy2API.exe")))
         check("_internal/qwindows.dll 已就位",
@@ -118,6 +181,84 @@ def main():
         check("进度最后一项是总数",
               bool(seen) and seen[-1][0] == seen[-1][1],
               repr(seen[-1] if seen else None))
+
+        # ---------------- 运行中升级 ----------------
+        print("\n=== 目标文件被占用时仍能完成升级 ===")
+        # 复现「程序正开着，用户点了升级」。Windows 不允许覆盖运行中的
+        # 镜像（ERROR_SHARING_VIOLATION），但允许改它的名字。安装器必须
+        # 走改名路线，而不是抛错中断 —— 更不能去结束那个进程。
+        locked_target = os.path.join(work, "locked")
+        os.makedirs(locked_target, exist_ok=True)
+        # 用带标记的载荷，好让"新文件真的落地了"能按内容断言，而不是看时间戳。
+        old_payload = os.path.join(work, "locked_old.zip")
+        new_payload = os.path.join(work, "locked_new.zip")
+        make_payload(old_payload, version="1.0.0", overlay=b"\x01" * 400)
+        make_payload(new_payload, version="2.0.0", overlay=b"\x02" * 900)
+        inst.extract_payload(old_payload, locked_target)
+
+        locked_exe = os.path.join(locked_target, "WorkBuddy2API.exe")
+        old_size = os.path.getsize(locked_exe)
+
+        handle = _hold_exclusive(locked_exe)
+        try:
+            # 先确认这个模拟是有效的：写覆盖必须失败。
+            try:
+                with open(locked_exe, "ab"):
+                    check("占用模拟有效（写打开应失败）", False, "竟然能写")
+            except OSError:
+                check("占用模拟有效（写打开被拒）", True)
+
+            count2, parked2 = inst.extract_payload(new_payload, locked_target)
+            check("被占用时解包不抛错", True)
+            check("报告了被挪开的文件", len(parked2) >= 1, repr(parked2))
+            check("挪开的文件确实存在",
+                  all(os.path.exists(p) for p in parked2), repr(parked2))
+            check("新 EXE 已就位", os.path.exists(locked_exe))
+            new_size = os.path.getsize(locked_exe)
+            check("落地的确实是新内容",
+                  new_size == old_size + 500,
+                  "%d -> %d（期望 %d）" % (old_size, new_size, old_size + 500))
+            # 被占用的那个文件必须原样保住，不能被截断。
+            check("被挪开的旧文件字节完整",
+                  all(os.path.getsize(p) == old_size for p in parked2),
+                  repr([(p, os.path.getsize(p)) for p in parked2]))
+        finally:
+            _release(handle)
+
+        # 进程退出（句柄释放）后，遗留的 .old 应该能被清掉。
+        swept = inst.clean_leftovers(locked_target)
+        check("解占用后能清掉遗留文件", swept >= 1, str(swept))
+        leftover = [n for n in os.listdir(locked_target) if ".old" in n]
+        check("清理后没有 .old 残留", leftover == [], repr(leftover))
+        # 清理不能误伤正常文件。
+        check("清理不动正常文件",
+              os.path.exists(os.path.join(locked_target, "WorkBuddy2API.exe"))
+              and os.path.exists(os.path.join(locked_target, "_internal")),
+              "安装目录被破坏")
+
+        # 旧实例还在跑时，被挪开的文件是删不掉的（真实运行镜像拒绝删除，
+        # WinError 5）。清理必须容错：能删的删掉，删不掉的留着，且不抛错。
+        # 用独立目录，免得和上一步的遗留文件互相干扰。
+        stuck_dir = os.path.join(work, "stuckdir")
+        os.makedirs(stuck_dir, exist_ok=True)
+        held = os.path.join(stuck_dir, "held.old")
+        free = os.path.join(stuck_dir, "free.old")
+        for path in (held, free):
+            with open(path, "wb") as fh:
+                fh.write(b"leftover")
+        no_delete = _hold_no_delete(held)
+        try:
+            try:
+                swept_held = inst.clean_leftovers(stuck_dir)
+                check("有删不掉的文件时不抛错", True)
+                check("只清理能删掉的那些", swept_held == 1, str(swept_held))
+                check("删不掉的遗留文件仍在", os.path.exists(held))
+                check("能删的遗留文件已清掉", not os.path.exists(free))
+            except Exception as exc:
+                check("有删不掉的文件时不抛错", False,
+                      "%s: %s" % (type(exc).__name__, exc))
+        finally:
+            _release(no_delete)
 
         # ---------------- 位置校验 ----------------
         print("\n=== 安装位置校验 ===")
