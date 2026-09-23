@@ -38,3 +38,35 @@ mcp.json
 # Custom third-party API providers; stores API keys in cleartext, so it must
 # never be committed.
 custom-providers.json
+
+# --- One-off scratch: probes, logs, generated images ------------------------
+# These are investigation leftovers. Each one was written to answer a single
+# question during debugging and has no ongoing role; the durable knowledge
+# lives in the real _test_*.py suites and in the README.
+_tmp_*
+_probe_*
+_full_*
+_build*.bat
+_b183_*.bat
+_run.bat
+_run_upload.bat
+_upload_*.bat
+_upload_*.py
+_commit_msg.txt
+.git_commit_msg.txt
+_release_notes.md
+_icon_preview.png
+_preview_icon.py
+_wizard_*.png
+_create_release.bat
+_gh_upload.py
+_stage_accounts.py
+_fix_shortcuts.py
+_check_artifacts.py
+_mtimes.py
+_vers.py
+_secret_scan.py
+
+# Built by _build_installer.py into the repo root as a staging copy for
+# installer.spec. The real source is uninstaller.spec.
+/uninstall.exe
