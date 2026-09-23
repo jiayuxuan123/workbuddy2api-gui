@@ -105,13 +105,13 @@ def fetch_growth_summary(account):
     except Exception as exc:
         _log(f"growth/streak query failed: {exc}")
     # 3. 猫猫旅行
-    try:
-        req = urllib.request.Request(CHAT_BASE + "/activity/growth/buddy/travel/status", headers=headers)
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            d = json.loads(resp.read().decode("utf-8"))
-            out["travel"] = d.get("data") or {}
-    except Exception as exc:
-        _log(f"buddy/travel/status query failed: {exc}")
+    ok, data, detail = _api_call(
+        _checked_url(CHAT_BASE, "/activity/growth/buddy/travel/status"),
+        headers)
+    if ok:
+        out["travel"] = data or {"state": "unknown"}
+    else:
+        _log(f"buddy/travel/status query failed: {detail}")
     return out
 
 
@@ -287,52 +287,168 @@ def report_events(account, events, base=BILL_BASE):
         return False
 
 
-def do_cat_travel(account):
-    """检查并执行猫猫旅行 (领奖 / 派出)。"""
-    headers = account.headers("chat")
-    # 1. 查询状态
+def _api_call(url, headers, method="GET", payload=None, timeout=15):
+    """Call an upstream endpoint and return ``(ok, data, detail)``.
+
+    Unlike the older call sites this never discards the response body: an
+    HTTP error carries a JSON explanation from the upstream
+    (``{"code":400,"msg":"invalid request"}``) and without it a protocol
+    mistake is indistinguishable from a network failure. That is exactly how
+    the travel bug stayed hidden - the handler reduced every failure to a
+    bare exception string.
+    """
+    body = None
+    if payload is not None:
+        body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=body, method=method, headers=headers)
     try:
-        req = urllib.request.Request(CHAT_BASE + "/activity/growth/buddy/travel/status", headers=headers)
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            d = json.loads(resp.read().decode("utf-8"))
-            st = d.get("data") or {}
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        try:
+            raw = exc.read().decode("utf-8", "replace")
+        except Exception:
+            raw = ""
+        detail = "HTTP %s" % exc.code
+        if raw:
+            detail += " " + raw[:300]
+        return False, None, detail
     except Exception as exc:
-        return {"ok": False, "msg": f"查询旅行状态失败: {exc}"}
+        return False, None, "%s: %s" % (type(exc).__name__, exc)
+
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return False, None, "响应不是 JSON: %s" % raw[:200]
+    if parsed.get("code") != 0:
+        return False, parsed, "code=%s msg=%s" % (
+            parsed.get("code"), parsed.get("msg"))
+    return True, parsed.get("data") or {}, ""
+
+
+def fetch_travel_locations(account):
+    """Return the destinations offered by ``travel/config``.
+
+    ``depart`` refuses an empty body with ``invalid request``; it wants a
+    ``location_id`` and a ``duration_hours``, and this is where the legal
+    values come from. Each entry carries ``id`` plus a duration window
+    (``duration_hours_min`` / ``duration_hours_max``).
+    """
+    url = _checked_url(CHAT_BASE, "/activity/growth/buddy/travel/config")
+    ok, data, detail = _api_call(url, account.headers("chat"))
+    if not ok:
+        _log(f"buddy/travel/config query failed: {detail}")
+        return []
+    locations = data.get("locations") or []
+    out = []
+    for item in locations:
+        try:
+            loc_id = int(item.get("id"))
+        except (TypeError, ValueError):
+            continue
+        low = item.get("duration_hours_min") or 1
+        high = item.get("duration_hours_max") or low
+        try:
+            low = max(1, int(low))
+            high = max(low, int(high))
+        except (TypeError, ValueError):
+            low, high = 1, 1
+        out.append({"id": loc_id, "code": item.get("code") or "",
+                    "name": item.get("name") or "", "min": low, "max": high})
+    return out
+
+
+def pick_travel_location(locations):
+    """Choose where the cat goes, and for how long.
+
+    The daily limit is one trip, so the longest legal trip is the best value:
+    it stays inside the duration window the upstream published for that
+    destination. ``index`` rotates the choice so the cat does not visit the
+    same place every day.
+    """
+    if not locations:
+        return None
+    index = int(time.time() // 86400) % len(locations)
+    chosen = locations[index]
+    return {"location_id": chosen["id"], "duration_hours": chosen["max"],
+            "name": chosen["name"] or chosen["code"] or str(chosen["id"])}
+
+
+def do_cat_travel(account):
+    """检查并执行猫猫旅行 (领奖 / 派出)。
+
+    协议（由真实账号探测确认，见仓库根目录的排查记录）::
+
+        GET  /activity/growth/buddy/travel/status   -> data.state
+        GET  /activity/growth/buddy/travel/config   -> data.locations[]
+        POST /activity/growth/buddy/travel/depart   <- {"location_id", "duration_hours"}
+        POST /activity/growth/buddy/travel/claim    <- 空请求体即可
+
+    ``depart`` 曾经固定发送空请求体 ``{}``，上游一律回
+    ``{"code":400,"msg":"invalid request"}`` —— 它需要显式指定目的地与时长。
+    ``claim`` 则相反，空请求体是合法的（无可领奖时回业务错误
+    ``no unclaimed travel``，而不是 invalid request）。
+    """
+    headers = account.headers("chat")
+    status_url = _checked_url(
+        CHAT_BASE, "/activity/growth/buddy/travel/status")
+    ok, st, detail = _api_call(status_url, headers)
+    if not ok:
+        return {"ok": False, "msg": f"查询旅行状态失败: {detail}"}
 
     state = st.get("state")
+
     if state == "arrived":
-        # 领奖（body 须为 {} 或空 JSON 对象）
-        cl_headers = dict(headers)
-        cl_headers["Content-Type"] = "application/json"
-        req_cl = urllib.request.Request(CHAT_BASE + "/activity/growth/buddy/travel/claim", data=b"{}", method="POST", headers=cl_headers)
-        try:
-            with urllib.request.urlopen(req_cl, timeout=10) as resp:
-                c_res = json.loads(resp.read().decode("utf-8"))
-                credit = (c_res.get("data") or {}).get("reward_credit", 0)
-                account.fetch_credits()
-                return {"ok": True, "action": "claim", "credit": credit, "msg": f"旅行归来领奖成功！获得 {credit} 积分"}
-        except Exception as e:
-            return {"ok": False, "msg": f"领奖失败: {e}"}
+        claim_url = _checked_url(
+            CHAT_BASE, "/activity/growth/buddy/travel/claim")
+        ok, data, detail = _api_call(
+            claim_url, headers, method="POST", payload={})
+        if not ok:
+            return {"ok": False, "msg": f"领奖失败: {detail}"}
+        credit = data.get("reward_credit", 0)
+        account.fetch_credits()
+        return {"ok": True, "action": "claim", "credit": credit,
+                "msg": f"旅行归来领奖成功！获得 {credit} 积分"}
+
+    if state == "traveling":
+        return {"ok": True, "action": "traveling",
+                "msg": "猫猫正在旅行途中，请稍后再来查看！"}
 
     if state == "idle":
         if st.get("daily_limit_reached"):
-            return {"ok": True, "action": "idle", "msg": "猫猫今日已完成旅行，明日 00:00 刷新"}
-        # 派出旅行（body 须为 {} 或空 JSON 对象，否则部分服务器返回 400）
-        dep_headers = dict(headers)
-        dep_headers["Content-Type"] = "application/json"
-        req_dep = urllib.request.Request(CHAT_BASE + "/activity/growth/buddy/travel/depart", data=b"{}", method="POST", headers=dep_headers)
-        try:
-            with urllib.request.urlopen(req_dep, timeout=10) as resp:
-                dep_res = json.loads(resp.read().decode("utf-8"))
-                if dep_res.get("code") == 0:
-                    return {"ok": True, "action": "depart", "msg": "猫猫已成功派出旅行，预计数小时后归来！"}
-        except Exception as e:
-            return {"ok": False, "msg": f"派出旅行失败: {e}"}
+            return {"ok": True, "action": "idle",
+                    "msg": "猫猫今日已完成旅行，明日 00:00 刷新"}
 
-    if state == "traveling":
-        return {"ok": True, "action": "traveling", "msg": "猫猫正在旅行途中，请稍后再来查看！"}
+        target = pick_travel_location(fetch_travel_locations(account))
+        if target is None:
+            return {"ok": False,
+                    "msg": "派出旅行失败: 未能获取可用的旅行目的地"}
+
+        depart_url = _checked_url(
+            CHAT_BASE, "/activity/growth/buddy/travel/depart")
+        payload = {"location_id": target["location_id"],
+                   "duration_hours": target["duration_hours"]}
+        ok, data, detail = _api_call(
+            depart_url, headers, method="POST", payload=payload)
+        if not ok:
+            return {"ok": False, "msg": f"派出旅行失败: {detail}"}
+        return {"ok": True, "action": "depart",
+                "msg": "猫猫已出发前往%s（%d 小时），预计 %s 归来！"
+                       % (target["name"], target["duration_hours"],
+                          _arrive_text(data.get("arrive_at")))}
 
     return {"ok": True, "action": state, "msg": f"当前状态: {state}"}
+
+
+def _arrive_text(arrive_at):
+    """Render the arrival timestamp as a short local clock time."""
+    try:
+        stamp = int(arrive_at)
+    except (TypeError, ValueError):
+        return "稍后"
+    if stamp <= 0:
+        return "稍后"
+    return time.strftime("%H:%M", time.localtime(stamp))
 
 
 def run_growth_tasks(account, gap=1.0):
