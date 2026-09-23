@@ -174,7 +174,7 @@ def install_console_close_handler():
         return None
 #: Release version. Shown in the window and compared against the published
 #: releases when checking for updates, so it must be bumped on every release.
-APP_VERSION = "1.8.1"
+APP_VERSION = "1.8.3"
 
 #: Where releases are published. The update check reads this repository's
 #: release feed; keeping it in one place means a fork only edits one line.

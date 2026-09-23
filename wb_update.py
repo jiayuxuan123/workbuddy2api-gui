@@ -135,15 +135,26 @@ def latest_release(timeout=CONNECT_TIMEOUT):
 
 
 def _release_assets(repo, tag, timeout=CONNECT_TIMEOUT):
-    """Asset download URLs for a tag, read from the expanded assets page.
+    """Portable-package download URLs for a tag, read from the assets page.
+
+    **Only ``.zip`` packages are returned.** An in-place update replaces the
+    program directory, so it needs the whole ``WorkBuddy2API.exe`` +
+    ``_internal/`` pair. A release also carries a Windows installer
+    (``*-setup.exe``) for new users, and a bare ``.exe`` cannot run without its
+    ``_internal/`` folder - downloading either would produce a broken install.
+    The updater therefore ignores every non-``.zip`` asset rather than
+    "downloading the first thing listed".
+
+    A ``-win64.zip`` package is ordered first when present, since that is the
+    layout :func:`extract_zip` knows how to unpack.
 
     Falls back to the conventional file name if the page cannot be read, so a
     layout change upstream degrades to "try the expected URL" rather than
     failing outright.
     """
     guesses = [
-        "https://github.com/%s/releases/download/%s/WorkBuddy2API.exe"
-        % (repo, tag),
+        "https://github.com/%s/releases/download/%s/WorkBuddy2API-%s-win64.zip"
+        % (repo, tag, tag),
     ]
     try:
         url = _checked("https://github.com/%s/releases/expanded_assets/%s"
@@ -153,13 +164,16 @@ def _release_assets(repo, tag, timeout=CONNECT_TIMEOUT):
         with _opener()(request, timeout=timeout) as resp:
             html = resp.read().decode("utf-8", "replace")
         found = re.findall(
-            r'href="(/[^"]+/releases/download/[^"]+\.(?:exe|zip))"', html)
+            r'href="(/[^"]+/releases/download/[^"]+\.zip)"', html)
         ordered = []
         for href in found:
             full = "https://github.com" + href
             if full not in ordered:
                 ordered.append(full)
         if ordered:
+            # Stable sort: win64 packages first, HTML order otherwise.
+            ordered.sort(
+                key=lambda u: 0 if u.lower().endswith("-win64.zip") else 1)
             return ordered
     except Exception:
         pass
