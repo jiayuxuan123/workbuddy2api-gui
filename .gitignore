@@ -66,6 +66,12 @@ _check_artifacts.py
 _mtimes.py
 _vers.py
 _secret_scan.py
+_msg_*.txt
+_chkproxy.py
+_relnotes_*.md
+_verify_*.py
+_audit_releases.py
+_b183_*.bat
 
 # Built by _build_installer.py into the repo root as a staging copy for
 # installer.spec. The real source is uninstaller.spec.
