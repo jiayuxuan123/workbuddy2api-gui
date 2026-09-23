@@ -54,7 +54,7 @@ APP_EXE = "WorkBuddy2API.exe"
 UNINST_EXE = "uninstall.exe"
 
 #: 版本号由打包脚本注入，源码直跑时用这个兜底值。
-DEFAULT_VERSION = "1.8.3"
+DEFAULT_VERSION = "1.8.4"
 
 #: 卸载信息在注册表中的位置（Add/Remove Programs 读的就是这里）。
 UNINSTALL_KEY = ("Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\"
